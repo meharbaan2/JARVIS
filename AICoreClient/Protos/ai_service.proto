@@ -1,0 +1,49 @@
+syntax = "proto3";
+option csharp_namespace = "AICoreClient";
+
+service AIService {
+    rpc ProcessQuery (QueryRequest) returns (QueryResponse);
+    rpc GetSystemStatus (Empty) returns (SystemStatus); // weather + greeting service
+    rpc RecognizeSpeech (AudioRequest) returns (QueryResponse);
+    rpc StreamSpeechStatus (Empty) returns (stream SpeechStatus);
+    rpc InterruptSpeech(Empty) returns (InterruptResponse) {};
+}
+
+message QueryRequest {
+    string input_text = 1;
+}
+
+message QueryResponse {
+    string response_text = 1;
+    string ai_source = 2;  // "DeepSeek" or "ChatGPT"
+}
+
+message Empty{} // For requests with no parameters
+
+message SystemStatus {
+    string greeting = 1;
+    string weather_report = 2;
+    string location = 3;
+    float temperature = 4;
+    string conditions = 5;
+    float wind_speed = 6;
+    int32 humidity = 7;
+    string local_time = 8;
+}
+
+message AudioRequest {
+    bytes audio_data = 1;          // Raw PCM audio data
+    string language_code = 2;      // "en-US" or "pa-IN"
+    int32 sample_rate = 3;         // 16000 (16kHz recommended)
+    optional string model = 4;     // Optional: "whisper" or "google"
+}
+
+message SpeechStatus {
+  string status = 1; // "start" or "end"
+  string message = 2;
+}
+
+message InterruptResponse {
+  bool success = 1;
+  string message = 2;
+}

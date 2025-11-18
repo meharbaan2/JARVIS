@@ -1,0 +1,21 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<TargetFramework>net8.0</TargetFramework>
+		<Nullable>enable</Nullable>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<CharacterEncoding>UTF-8</CharacterEncoding>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Google.Protobuf" Version="3.31.0" />
+		<PackageReference Include="Grpc.Net.Client" Version="2.71.0" />
+		<PackageReference Include="NAudio" Version="2.2.1" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\AICoreClient\AICoreClient.csproj" />
+	</ItemGroup>
+
+</Project>
