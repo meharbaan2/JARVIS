@@ -48,33 +48,33 @@ A sophisticated **multilingual voice-enabled AI assistant** with real-time speec
 
 ### Installation & Running
 
-1. **Clone the repository**
+1. **Clone the repository**  
 git clone https://github.com/yourusername/jarvis-ai-assistant.git
 cd jarvis-ai-assistant
 
-2. **Build VoiceBridge**
-- cd VoiceBridge
-- dotnet build -c Release
+3. **Build VoiceBridge**  
+cd VoiceBridge  
+dotnet build -c Release
 
-3. **Update VoiceBridge path in ElectronApp/main.js**
-- const voiceExe = 'D:/your-project-folder/VoiceBridge/bin/Release/net8.0/VoiceBridge.exe';
+4. **Update VoiceBridge path in ElectronApp/main.js**  
+const voiceExe = 'D:/your-project-folder/VoiceBridge/bin/Release/net8.0/VoiceBridge.exe';
 
-4. **Add API Keys (optional)**
-In PythonServer/ai_server.py
-- self.mistral_api_key = "YOUR_MISTRAL_KEY"
-- self.weather_api_key = "YOUR_OPENWEATHER_KEY"
+4. **Add API Keys (optional)**  
+In PythonServer/ai_server.py  
+self.mistral_api_key = "YOUR_MISTRAL_KEY"  
+self.weather_api_key = "YOUR_OPENWEATHER_KEY"
 
-5. **Build UI dist**
-- cd ../ui
-- npm build
+5. **Build UI dist**  
+cd ../ui  
+npm build
 
-6. **Install dependencies & start Electron app**
-- cd ../electron
-- npm install
-- npm start
+6. **Install dependencies & start Electron app**  
+cd ../electron  
+npm install  
+npm start
 
 **Electron will automatically:**
-- Start Python gRPC server 
+Start Python gRPC server 
 - Launch VoiceBridge
 - Load AI models 
 - Open the UI
