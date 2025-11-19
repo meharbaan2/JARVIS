@@ -2,10 +2,10 @@
 
 A sophisticated **multilingual voice-enabled AI assistant** with real-time speech recognition, text-to-speech (English & Punjabi), and intelligent model routing. Runs fully locally or via external APIs, with conversation memory and startup weather announcements.
 
-![AI Assistant](images/screenshot.png)
-![Punjabi](images/screenshot2.png)
-![Speaking](images/screenshot3.png)
-![User](images/screenshot4.png)
+![AI Assistant](images/Screenshot.jpg)
+![Punjabi](images/Screenshot2.jpg)
+![Speaking](images/Screenshot3.jpg)
+![User](images/Screenshot4.jpg)
 
 ---
 
