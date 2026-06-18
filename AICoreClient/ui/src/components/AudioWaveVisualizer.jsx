@@ -1,7 +1,9 @@
 ﻿import React, { useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
+import { Square } from 'lucide-react';
 
-export default function AudioWaveVisualizer({ isActive, assistantName = 'JARVIS' }) {
+export default function AudioWaveVisualizer({ isActive, assistantName = 'JARVIS', onStop }) {
+    const MotionDiv = motion.div;
     const canvasRef = useRef(null);
     const animationRef = useRef(null);
     const barsRef = useRef([]);
@@ -185,6 +187,21 @@ export default function AudioWaveVisualizer({ isActive, assistantName = 'JARVIS'
         letterSpacing: '0.05em'
     };
 
+    const stopButtonStyle = {
+        border: '1px solid rgba(248, 113, 113, 0.42)',
+        borderRadius: '9999px',
+        padding: '8px 14px',
+        background: 'rgba(127, 29, 29, 0.62)',
+        color: '#fee2e2',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: '8px',
+        cursor: 'pointer',
+        fontSize: '0.8rem',
+        fontWeight: 700,
+        letterSpacing: '0.03em'
+    };
+
     const canvasStyle = {
         width: '100%',
         height: '128px',
@@ -213,7 +230,7 @@ export default function AudioWaveVisualizer({ isActive, assistantName = 'JARVIS'
     };
 
     return (
-        <motion.div
+        <MotionDiv
             initial={{ opacity: 0, scale: 0.9 }}
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.9 }}
@@ -225,11 +242,19 @@ export default function AudioWaveVisualizer({ isActive, assistantName = 'JARVIS'
 
                 <div style={contentStyle}>
                     <div style={{ textAlign: 'center', marginBottom: '16px' }}>
-                        <div style={statusBadgeStyle}>
-                            <div style={pulseDotStyle}></div>
-                            <span style={statusTextStyle}>
-                                {assistantName} SPEAKING
-                            </span>
+                        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                            <div style={statusBadgeStyle}>
+                                <div style={pulseDotStyle}></div>
+                                <span style={statusTextStyle}>
+                                    {assistantName} SPEAKING
+                                </span>
+                            </div>
+                            {onStop && (
+                                <button type="button" onClick={onStop} style={stopButtonStyle}>
+                                    <Square style={{ width: '12px', height: '12px', fill: '#fee2e2' }} />
+                                    STOP
+                                </button>
+                            )}
                         </div>
                     </div>
 
@@ -245,6 +270,6 @@ export default function AudioWaveVisualizer({ isActive, assistantName = 'JARVIS'
 
             {/* Bottom glow */}
             <div style={bottomGlowStyle}></div>
-        </motion.div>
+        </MotionDiv>
     );
 }

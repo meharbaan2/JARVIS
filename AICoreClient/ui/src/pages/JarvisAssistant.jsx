@@ -3,27 +3,81 @@ import { Send, Mic, MicOff, Languages, Square } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import AudioWaveVisualizer from '../components/AudioWaveVisualizer';
 import MessageBubble from '../components/MessageBubble';
+import RuntimePanel from '../components/RuntimePanel';
 
 export default function JarvisAssistant() {
     const [language, setLanguage] = useState('english');
     const [messages, setMessages] = useState([
-        { sender: 'jarvis', text: 'Good evening, sir. J.A.R.V.I.S at your service.', timestamp: new Date() }
+        { sender: 'jarvis', text: 'Good evening. J.A.R.V.I.S is online.', timestamp: new Date() }
     ]);
     const [inputText, setInputText] = useState('');
     const [isListening, setIsListening] = useState(false);
     const [isSpeaking, setIsSpeaking] = useState(false);
     const [isRecording, setIsRecording] = useState(false);
+    const [recognitionStatus, setRecognitionStatus] = useState('');
+    const [isRuntimeOpen, setIsRuntimeOpen] = useState(false);
     const messagesEndRef = useRef(null);
     const messagesContainerRef = useRef(null);
 
     const assistantName = language === 'punjabi' ? 'FRIDAY' : 'JARVIS';
     const assistantFullName = language === 'punjabi'
         ? 'Female Replacement Intelligent Digital Assistant Youth'
-        : 'Just A Rather Very Intelligent System';
+        : language === 'mixed'
+            ? 'English/Punjabi Mixed Recognition Mode'
+            : 'Just A Rather Very Intelligent System';
+    const MotionDiv = motion.div;
+    const languageModes = [
+        { id: 'english', label: 'English' },
+        { id: 'mixed', label: 'Mixed' },
+        { id: 'punjabi', label: 'ਪੰਜਾਬੀ' },
+    ];
+    const normalizeAssistantResponse = (response) => {
+        if (response && typeof response === 'object') {
+            return {
+                text: response.response_text || response.text || '',
+                source: response.ai_source || response.source || 'Unknown',
+            };
+        }
+        return {
+            text: String(response ?? ''),
+            source: 'Unknown',
+        };
+    };
+    const replaceListeningMessage = React.useCallback((recognizedText) => {
+        setMessages(prev => {
+            const next = [...prev];
+            for (let index = next.length - 1; index >= 0; index -= 1) {
+                if (next[index]?.sender === 'user' && next[index]?.text === '[Listening...]') {
+                    next[index] = { sender: 'user', text: recognizedText, timestamp: new Date() };
+                    return next;
+                }
+            }
+            return [...next, { sender: 'user', text: recognizedText, timestamp: new Date() }];
+        });
+    }, []);
+    const removeListeningMessage = React.useCallback(() => {
+        setMessages(prev => prev.filter(message => !(message.sender === 'user' && message.text === '[Listening...]')));
+    }, []);
+    const languageButtonStyle = (mode) => ({
+        padding: '8px 14px',
+        borderRadius: '8px',
+        fontSize: '0.875rem',
+        fontWeight: 500,
+        transition: 'all 0.3s',
+        ...(language === mode ? {
+            background: 'linear-gradient(to right, #22d3ee, #3b82f6)',
+            color: 'white',
+            boxShadow: '0 0 20px rgba(0, 212, 255, 0.4)'
+        } : {
+            background: 'rgba(13, 13, 36, 0.5)',
+            color: 'rgba(0, 212, 255, 0.6)',
+            border: '1px solid rgba(0, 212, 255, 0.2)'
+        })
+    });
 
     // --- SPEECH INTERRUPTION FUNCTION ---
-    const interruptSpeech = async () => {
-        if (isSpeaking) {
+    const interruptSpeech = React.useCallback(async (force = false) => {
+        if (isSpeaking || force) {
             console.log('[UI] Interrupting current speech');
             try {
                 // Immediately hide the wave visualizer
@@ -40,7 +94,7 @@ export default function JarvisAssistant() {
                 console.error('[UI] Failed to interrupt speech:', error);
             }
         }
-    };
+    }, [isSpeaking]);
 
     // --- INTERRUPT SPEECH WHEN USER TYPES ---
     useEffect(() => {
@@ -48,7 +102,7 @@ export default function JarvisAssistant() {
             console.log('[UI] User started typing - interrupting speech');
             interruptSpeech();
         }
-    }, [inputText]); // This runs whenever inputText changes
+    }, [inputText, interruptSpeech, isSpeaking]); // This runs whenever inputText changes
 
 
     // --- SPEECH EVENT HANDLER ---
@@ -64,10 +118,20 @@ export default function JarvisAssistant() {
             if (data.type === 'recording_start') {
                 console.log('[UI] User recording started');
                 setIsRecording(true); // Show recording state
+                setRecognitionStatus('listening');
             }
             else if (data.type === 'recording_end') {
                 console.log('[UI] User recording ended');
                 setIsRecording(false); // Hide recording state
+                setIsListening(false);
+                setRecognitionStatus('');
+            }
+            else if (data.type === 'recording_cancelled') {
+                console.log('[UI] User recording cancelled');
+                setIsRecording(false);
+                setIsListening(false);
+                setRecognitionStatus('');
+                removeListeningMessage();
             }
             else if (data.type === 'jarvis_speak_start') {
                 console.log('[UI] JARVIS speaking started - show wave');
@@ -79,18 +143,26 @@ export default function JarvisAssistant() {
             }
             else if (data.type === 'recognized' && data.text) {
                 console.log('[UI] Recognized speech:', data.text);
+                setIsListening(false);
+                setIsRecording(false);
+                setRecognitionStatus('');
 
                 // Interrupt any ongoing speech before processing new voice input
-                interruptSpeech();
+                interruptSpeech(true);
 
-                // Add the recognized text as a user message
-                const userMessage = { sender: 'user', text: data.text, timestamp: new Date() };
-                setMessages(prev => [...prev, userMessage]);
+                // Replace the listening placeholder with the recognized text.
+                replaceListeningMessage(data.text);
 
                 // Send recognized text to AI backend
                 window.electronAPI.sendMessage(data.text)
                     .then(response => {
-                        const jarvisMessage = { sender: 'jarvis', text: response, timestamp: new Date() };
+                        const normalized = normalizeAssistantResponse(response);
+                        const jarvisMessage = {
+                            sender: 'jarvis',
+                            text: normalized.text,
+                            source: normalized.source,
+                            timestamp: new Date()
+                        };
                         setMessages(prev => [...prev, jarvisMessage]);
                     })
                     .catch(err => {
@@ -103,17 +175,28 @@ export default function JarvisAssistant() {
                         setMessages(prev => [...prev, errorMessage]);
                     });
             }
-        };
-
-        window.electronAPI.onSpeechEvent(handleSpeechEvent);
-
-        return () => {
-            // optional: cleanup handler
-            if (window.electronAPI?.removeAllListeners) {
-                window.electronAPI.removeAllListeners('speech-event');
+            else if (data.type === 'voice_error') {
+                console.error('[VOICE EVENT ERROR]', data.message);
+                setIsListening(false);
+                setIsRecording(false);
+                setRecognitionStatus('');
+                removeListeningMessage();
+                setMessages(prev => [
+                    ...prev,
+                    { sender: 'jarvis', text: data.message || 'Voice capture failed.', timestamp: new Date() }
+                ]);
+            }
+            else if (data.type === 'recognition_partial') {
+                setRecognitionStatus(data.text || '');
             }
         };
-    }, []);
+
+        const unsubscribe = window.electronAPI.onSpeechEvent(handleSpeechEvent);
+
+        return () => {
+            unsubscribe?.();
+        };
+    }, [interruptSpeech, replaceListeningMessage, removeListeningMessage]);
 
 
     const scrollToBottom = () => {
@@ -130,11 +213,14 @@ export default function JarvisAssistant() {
 
     const handleLanguageChange = (newLanguage) => {
         setLanguage(newLanguage);
+        const languageMessage = newLanguage === 'punjabi'
+            ? 'ਸਤਿ ਸ੍ਰੀ ਅਕਾਲ, ਮੈਂ F.R.I.D.A.Y. ਹਾਂ। ਮੈਂ ਤੁਹਾਡੀ ਕਿਵੇਂ ਮਦਦ ਕਰ ਸਕਦੀ ਹਾਂ?'
+            : newLanguage === 'mixed'
+                ? 'Mixed English/Punjabi recognition is active. Speak naturally in either language.'
+                : 'Language switched to English. J.A.R.V.I.S is online.';
         const systemMessage = {
             sender: 'jarvis',
-            text: newLanguage === 'punjabi'
-                ? 'ਸਤਿ ਸ੍ਰੀ ਅਕਾਲ, ਮੈਂ F.R.I.D.A.Y. ਹਾਂ। ਮੈਂ ਤੁਹਾਡੀ ਕਿਵੇਂ ਮਦਦ ਕਰ ਸਕਦੀ ਹਾਂ?'
-                : 'Language switched to English. J.A.R.V.I.S at your service.',
+            text: languageMessage,
             timestamp: new Date()
         };
         setMessages(prev => [...prev, systemMessage]);
@@ -144,7 +230,7 @@ export default function JarvisAssistant() {
         if (!inputText.trim()) return;
 
         // Interrupt any ongoing speech first
-        await interruptSpeech();
+        await interruptSpeech(true);
 
         const userMessage = { sender: 'user', text: inputText, timestamp: new Date() };
         setMessages(prev => [...prev, userMessage]);
@@ -157,12 +243,14 @@ export default function JarvisAssistant() {
                 throw new Error('Electron API not available');
             }
 
-            const responseText = await window.electronAPI.sendMessage(inputText);
-            console.log('[UI] Received response from Electron:', responseText);
+            const response = await window.electronAPI.sendMessage(inputText);
+            const normalized = normalizeAssistantResponse(response);
+            console.log('[UI] Received response from Electron:', response);
 
             const jarvisMessage = {
                 sender: 'jarvis',
-                text: responseText,
+                text: normalized.text,
+                source: normalized.source,
                 timestamp: new Date()
             };
             setMessages(prev => [...prev, jarvisMessage]);
@@ -180,28 +268,42 @@ export default function JarvisAssistant() {
 
     const handleVoiceInput = async () => {
         if (isListening) {
-            setIsListening(false);
+            setRecognitionStatus('stopping');
+            if (window.electronAPI?.stopVoice) {
+                await window.electronAPI.stopVoice();
+            } else {
+                setIsListening(false);
+                setIsRecording(false);
+                removeListeningMessage();
+            }
             return;
         }
 
         // Interrupt any ongoing speech first
-        await interruptSpeech();
+        await interruptSpeech(true);
 
         setIsListening(true);
+        setRecognitionStatus('starting');
 
         const userMessage = { sender: 'user', text: '[Listening...]', timestamp: new Date() };
         setMessages(prev => [...prev, userMessage]);
 
         try {
-            const lang = language === 'punjabi' ? 'punjabi' : 'english';
+            const lang = language === 'punjabi' ? 'punjabi' : language === 'mixed' ? 'mixed' : 'english';
             console.log('[UI] Triggering voice input:', lang);
 
             // Ask Electron to trigger the VoiceBridge.exe process
-            await window.electronAPI.triggerVoice(lang);
+            const result = await window.electronAPI.triggerVoice(lang);
+            if (result && result.success === false) {
+                throw new Error(result.message || 'Voice capture failed to start.');
+            }
 
         } catch (err) {
             console.error('[VOICE INPUT ERROR]', err);
             setIsListening(false);
+            setIsRecording(false);
+            setRecognitionStatus('');
+            removeListeningMessage();
             setMessages(prev => [
                 ...prev,
                 { sender: 'jarvis', text: 'Voice capture failed.', timestamp: new Date() }
@@ -296,7 +398,7 @@ export default function JarvisAssistant() {
 
             <div style={{ position: 'relative', zIndex: 10, display: 'flex', flexDirection: 'column', height: '100vh', padding: '2rem' }}>
                 {/* Header */}
-                <motion.div
+                <MotionDiv
                     initial={{ opacity: 0, y: -20 }}
                     animate={{ opacity: 1, y: 0 }}
                     style={{ marginBottom: '2rem' }}
@@ -360,8 +462,31 @@ export default function JarvisAssistant() {
                             </div>
                         </div>
 
-                        {/* Language Selector */}
-                        <div style={{ position: 'relative' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+                            <button
+                                type="button"
+                                onClick={() => setIsRuntimeOpen(true)}
+                                style={{
+                                    height: '44px',
+                                    padding: '0 14px',
+                                    borderRadius: '8px',
+                                    border: '1px solid rgba(0, 212, 255, 0.24)',
+                                    background: 'rgba(10, 10, 26, 0.68)',
+                                    color: '#dff9ff',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '8px',
+                                    cursor: 'pointer',
+                                    fontSize: '0.82rem',
+                                    fontWeight: 600,
+                                }}
+                            >
+                                <Square style={{ width: '14px', height: '14px', color: '#22d3ee' }} />
+                                Runtime
+                            </button>
+
+                            {/* Language Selector */}
+                            <div style={{ position: 'relative' }}>
                             <div style={glassContainerStyle}>
                                 <div style={{
                                     background: 'rgba(10, 10, 26, 0.6)',
@@ -372,60 +497,30 @@ export default function JarvisAssistant() {
                                         <Languages style={{ width: '16px', height: '16px', color: '#22d3ee' }} />
                                         <span style={{ color: '#22d3ee', fontSize: '0.75rem', fontWeight: 500, letterSpacing: '0.1em' }}>LANGUAGE</span>
                                     </div>
-                                    <div style={{ display: 'flex', gap: '0.5rem' }}>
-                                        <button
-                                            onClick={() => handleLanguageChange('english')}
-                                            style={{
-                                                padding: '8px 16px',
-                                                borderRadius: '8px',
-                                                fontSize: '0.875rem',
-                                                fontWeight: 500,
-                                                transition: 'all 0.3s',
-                                                ...(language === 'english' ? {
-                                                    background: 'linear-gradient(to right, #22d3ee, #3b82f6)',
-                                                    color: 'white',
-                                                    boxShadow: '0 0 20px rgba(0, 212, 255, 0.4)'
-                                                } : {
-                                                    background: 'rgba(13, 13, 36, 0.5)',
-                                                    color: 'rgba(0, 212, 255, 0.6)',
-                                                    border: '1px solid rgba(0, 212, 255, 0.2)'
-                                                })
-                                            }}
-                                        >
-                                            English
-                                        </button>
-                                        <button
-                                            onClick={() => handleLanguageChange('punjabi')}
-                                            style={{
-                                                padding: '8px 16px',
-                                                borderRadius: '8px',
-                                                fontSize: '0.875rem',
-                                                fontWeight: 500,
-                                                transition: 'all 0.3s',
-                                                ...(language === 'punjabi' ? {
-                                                    background: 'linear-gradient(to right, #22d3ee, #3b82f6)',
-                                                    color: 'white',
-                                                    boxShadow: '0 0 20px rgba(0, 212, 255, 0.4)'
-                                                } : {
-                                                    background: 'rgba(13, 13, 36, 0.5)',
-                                                    color: 'rgba(0, 212, 255, 0.6)',
-                                                    border: '1px solid rgba(0, 212, 255, 0.2)'
-                                                })
-                                            }}
-                                        >
-                                            ਪੰਜਾਬੀ
-                                        </button>
+                                    <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                                        {languageModes.map((mode) => (
+                                            <button
+                                                key={mode.id}
+                                                onClick={() => handleLanguageChange(mode.id)}
+                                                style={languageButtonStyle(mode.id)}
+                                            >
+                                                {mode.label}
+                                            </button>
+                                        ))}
                                     </div>
                                 </div>
                             </div>
+                            </div>
                         </div>
                     </div>
-                </motion.div>
+                </MotionDiv>
+
+                <RuntimePanel open={isRuntimeOpen} onClose={() => setIsRuntimeOpen(false)} />
 
                 {/* Audio Wave Visualizer - Fixed overlay that doesn't affect layout */}
                 <AnimatePresence>
                     {isSpeaking && (
-                        <motion.div
+                        <MotionDiv
                             initial={{ opacity: 0, y: -20 }}
                             animate={{ opacity: 1, y: 0 }}
                             exit={{ opacity: 0, y: 20 }}
@@ -435,11 +530,15 @@ export default function JarvisAssistant() {
                                 left: '2rem',
                                 right: '2rem',
                                 zIndex: 1000, // Very high z-index to ensure it's above everything
-                                pointerEvents: 'none' // Don't interfere with clicks
+                                pointerEvents: 'auto'
                             }}
                         >
-                            <AudioWaveVisualizer isActive={isSpeaking} assistantName={assistantName} />
-                        </motion.div>
+                            <AudioWaveVisualizer
+                                isActive={isSpeaking}
+                                assistantName={assistantName}
+                                onStop={() => interruptSpeech(true)}
+                            />
+                        </MotionDiv>
                     )}
                 </AnimatePresence>
 
@@ -502,7 +601,7 @@ export default function JarvisAssistant() {
                 </div>
 
                 {/* Input Area */}
-                <motion.div
+                <MotionDiv
                     initial={{ opacity: 0, y: 20 }}
                     animate={{ opacity: 1, y: 0 }}
                     style={{ position: 'relative' }}
@@ -569,7 +668,13 @@ export default function JarvisAssistant() {
                                         value={inputText}
                                         onChange={(e) => setInputText(e.target.value)}
                                         onKeyPress={handleKeyPress}
-                                        placeholder={language === 'punjabi' ? 'ਆਪਣਾ ਸਵਾਲ ਪੁੱਛੋ...' : 'Speak or type your command...'}
+                                        placeholder={
+                                            language === 'punjabi'
+                                                ? 'ਆਪਣਾ ਸਵਾਲ ਪੁੱਛੋ...'
+                                                : language === 'mixed'
+                                                    ? 'Speak in English or Punjabi...'
+                                                    : 'Speak or type your command...'
+                                        }
                                         style={{
                                             width: '100%',
                                             background: 'rgba(13, 13, 36, 0.5)',
@@ -622,18 +727,68 @@ export default function JarvisAssistant() {
 
                             {/* Status indicator */}
                             {isListening && (
-                                <motion.div
+                                <MotionDiv
                                     initial={{ opacity: 0, y: -10 }}
                                     animate={{ opacity: 1, y: 0 }}
                                     style={{ marginTop: '12px', display: 'flex', alignItems: 'center', gap: '0.5rem', color: '#f87171', fontSize: '0.875rem' }}
                                 >
                                     <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#f87171', animation: 'pulse 2s infinite' }}></div>
-                                    {language === 'punjabi' ? 'ਸੁਣ ਰਿਹਾ ਹੈ...' : 'Listening...'}
-                                </motion.div>
+                                    {recognitionStatus === 'stopping'
+                                        ? 'Stopping listening...'
+                                        : language === 'punjabi'
+                                            ? 'ਸੁਣ ਰਿਹਾ ਹੈ...'
+                                            : language === 'mixed'
+                                                ? 'Listening for English/Punjabi...'
+                                                : 'Listening...'}
+                                </MotionDiv>
+                            )}
+                            {isRecording && (
+                                <MotionDiv
+                                    initial={{ opacity: 0, y: -10 }}
+                                    animate={{ opacity: 1, y: 0 }}
+                                    style={{ marginTop: '8px', display: 'flex', alignItems: 'center', gap: '0.5rem', color: '#67e8f9', fontSize: '0.8rem' }}
+                                >
+                                    <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#22d3ee', animation: 'pulse 2s infinite' }}></div>
+                                    {recognitionStatus
+                                        ? `Voice status: ${recognitionStatus}`
+                                        : language === 'punjabi'
+                                            ? 'ਰਿਕਾਰਡਿੰਗ ਜਾਰੀ ਹੈ...'
+                                            : language === 'mixed'
+                                                ? 'Recording mixed-language audio...'
+                                                : 'Recording audio...'}
+                                </MotionDiv>
+                            )}
+                            {isSpeaking && (
+                                <MotionDiv
+                                    initial={{ opacity: 0, y: -10 }}
+                                    animate={{ opacity: 1, y: 0 }}
+                                    style={{ marginTop: '8px', display: 'flex', alignItems: 'center', gap: '0.5rem', color: '#fca5a5', fontSize: '0.8rem' }}
+                                >
+                                    <button
+                                        type="button"
+                                        onClick={() => interruptSpeech(true)}
+                                        style={{
+                                            border: '1px solid rgba(248, 113, 113, 0.42)',
+                                            borderRadius: '8px',
+                                            padding: '6px 10px',
+                                            background: 'rgba(127, 29, 29, 0.46)',
+                                            color: '#fee2e2',
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: '6px',
+                                            cursor: 'pointer',
+                                            fontSize: '0.78rem',
+                                            fontWeight: 700
+                                        }}
+                                    >
+                                        <Square style={{ width: '12px', height: '12px', fill: '#fee2e2' }} />
+                                        Stop speaking
+                                    </button>
+                                </MotionDiv>
                             )}
                         </div>
                     </div>
-                </motion.div>
+                </MotionDiv>
             </div>
         </div>
     );

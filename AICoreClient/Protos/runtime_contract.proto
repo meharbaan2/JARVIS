@@ -1,0 +1,283 @@
+syntax = "proto3";
+option csharp_namespace = "Hivemind.Runtime";
+
+// Target contract for the modular runtime. This file is intentionally separate
+// from ai_service.proto so the current UI remains compatible while services are
+// extracted.
+
+service RuntimeService {
+  rpc ListCapabilities (ListCapabilitiesRequest) returns (ListCapabilitiesResponse);
+  rpc GetCapabilitySchema (CapabilityRef) returns (CapabilitySchema);
+  rpc RunCapability (RunCapabilityRequest) returns (RunCapabilityResponse);
+  rpc StreamCapabilityEvents (RunRef) returns (stream CapabilityEvent);
+  rpc CancelRun (RunRef) returns (CancelRunResponse);
+  rpc HealthCheck (HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+service RuntimeMemoryService {
+  rpc SearchMemory (MemorySearchRequest) returns (MemorySearchResponse);
+  rpc IndexProjectMemory (IndexProjectMemoryRequest) returns (IndexProjectMemoryResponse);
+  rpc RecentToolRuns (RecentToolRunsRequest) returns (RecentToolRunsResponse);
+  rpc RecentExecutionPlans (RecentExecutionPlansRequest) returns (RecentExecutionPlansResponse);
+  rpc GetMemoryStats (MemoryStatsRequest) returns (MemoryStatsResponse);
+}
+
+service RuntimeModelService {
+  rpc ListModels (ListModelsRequest) returns (ListModelsResponse);
+  rpc GetModelStatus (ModelRef) returns (ModelStatusResponse);
+  rpc LoadModel (ModelRef) returns (ModelActionResponse);
+  rpc UnloadModel (ModelRef) returns (ModelActionResponse);
+  rpc ProbeModel (ModelProbeRequest) returns (ModelProbeResponse);
+}
+
+service VoiceService {
+  rpc StreamRecognizeSpeech (stream AudioChunk) returns (stream SpeechRecognitionEvent);
+  rpc Speak (SpeakRequest) returns (SpeakResponse);
+  rpc InterruptSpeech (InterruptSpeechRequest) returns (InterruptSpeechResponse);
+}
+
+message ListCapabilitiesRequest {}
+
+message CapabilityRef {
+  string tool_name = 1;
+  string capability_name = 2;
+}
+
+message Capability {
+  string tool_name = 1;
+  string capability_name = 2;
+  string description = 3;
+  string input_schema_json = 4;
+  string safety_level = 5;
+  bool supports_progress = 6;
+  bool supports_cancel = 7;
+  bool available = 8;
+  string runtime = 9;
+  string root = 10;
+  string examples_json = 11;
+  string tool_description = 12;
+}
+
+message ListCapabilitiesResponse {
+  repeated Capability capabilities = 1;
+}
+
+message CapabilitySchema {
+  Capability capability = 1;
+}
+
+message RunCapabilityRequest {
+  CapabilityRef capability = 1;
+  string input_json = 2;
+  string project_context = 3;
+}
+
+message RunRef {
+  string run_id = 1;
+}
+
+message RunCapabilityResponse {
+  RunRef run = 1;
+  string status = 2;
+  string output_json = 3;
+  string error_message = 4;
+}
+
+message CapabilityEvent {
+  RunRef run = 1;
+  string type = 2;
+  string message = 3;
+  float progress = 4;
+}
+
+message CancelRunResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  string status = 1;
+  repeated string details = 2;
+}
+
+message MemorySearchRequest {
+  string query = 1;
+  string project = 2;
+  int32 limit = 3;
+}
+
+message MemoryHit {
+  string project = 1;
+  string source_path = 2;
+  string title = 3;
+  int32 chunk_index = 4;
+  string snippet = 5;
+  float score = 6;
+}
+
+message MemorySearchResponse {
+  repeated MemoryHit hits = 1;
+}
+
+message IndexProjectMemoryRequest {
+  repeated string project_names = 1;
+  bool include_manifests = 2;
+  int32 max_files_per_project = 3;
+}
+
+message ProjectIndexResult {
+  string project = 1;
+  string root = 2;
+  int32 indexed_document_count = 3;
+  string status = 4;
+}
+
+message IndexProjectMemoryResponse {
+  repeated ProjectIndexResult results = 1;
+  int32 total_indexed_document_count = 2;
+}
+
+message RecentToolRunsRequest {
+  int32 limit = 1;
+}
+
+message ToolRunRecord {
+  string tool_name = 1;
+  string capability_name = 2;
+  string status = 3;
+  string input_json = 4;
+  string artifact_path = 5;
+  string metrics_json = 6;
+  string evidence_status = 7;
+  string started_at = 8;
+  string finished_at = 9;
+}
+
+message RecentToolRunsResponse {
+  repeated ToolRunRecord runs = 1;
+}
+
+message RecentExecutionPlansRequest {
+  int32 limit = 1;
+}
+
+message ExecutionPlanRecord {
+  string id = 1;
+  string intent = 2;
+  string source = 3;
+  string status = 4;
+  string created_at = 5;
+  string finished_at = 6;
+  string result_summary = 7;
+  string error = 8;
+  string steps_json = 9;
+}
+
+message RecentExecutionPlansResponse {
+  repeated ExecutionPlanRecord plans = 1;
+}
+
+message MemoryStatsRequest {}
+
+message MemoryStatsResponse {
+  string stats_json = 1;
+}
+
+message ListModelsRequest {}
+
+message ModelRef {
+  string model_name = 1;
+}
+
+message ModelRecord {
+  string name = 1;
+  string provider = 2;
+  string kind = 3;
+  string purpose = 4;
+  string model_name = 5;
+  bool available = 6;
+  string status = 7;
+  int32 priority = 8;
+  string metadata_json = 9;
+}
+
+message ListModelsResponse {
+  repeated ModelRecord models = 1;
+  int32 model_count = 2;
+  int32 available_model_count = 3;
+}
+
+message ModelStatusResponse {
+  ModelRecord model = 1;
+  bool found = 2;
+  string message = 3;
+}
+
+message ModelActionResponse {
+  ModelRecord model = 1;
+  bool success = 2;
+  string status = 3;
+  string message = 4;
+}
+
+message ModelProbePrompt {
+  string category = 1;
+  string prompt = 2;
+  string expected_hint = 3;
+}
+
+message ModelProbeRequest {
+  string model_name = 1;
+  repeated ModelProbePrompt prompts = 2;
+}
+
+message ModelProbeResult {
+  string category = 1;
+  string prompt = 2;
+  string response_text = 3;
+  string expected_hint = 4;
+  string status = 5;
+  string warning = 6;
+  double latency_ms = 7;
+}
+
+message ModelProbeResponse {
+  ModelRecord model = 1;
+  bool success = 2;
+  string status = 3;
+  string message = 4;
+  repeated ModelProbeResult results = 5;
+}
+
+message AudioChunk {
+  bytes audio_data = 1;
+  string language_code = 2;
+  int32 sample_rate = 3;
+  bool end_of_utterance = 4;
+}
+
+message SpeechRecognitionEvent {
+  string type = 1; // partial, final, error
+  string text = 2;
+  string language_code = 3;
+  float confidence = 4;
+}
+
+message SpeakRequest {
+  string text = 1;
+  string language_code = 2;
+}
+
+message SpeakResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message InterruptSpeechRequest {}
+
+message InterruptSpeechResponse {
+  bool success = 1;
+  string message = 2;
+}

@@ -12,6 +12,11 @@ import torch
 import logging
 import socket
 import re
+import json
+import gc
+import hashlib
+import subprocess
+from pathlib import Path
 from accelerate import infer_auto_device_map
 import pyttsx3
 import win32com.client
@@ -35,6 +40,25 @@ import sys
 import codecs
 from transformers.cache_utils import DynamicCache
 import types
+from runtime_config import settings as runtime_settings
+from memory_service import MemoryService
+from tool_registry import create_default_registry
+from orchestrator import RuntimeOrchestrator
+from voice_utils import normalize_for_tts, split_into_speech_chunks
+from embedding_service import create_embedding_provider
+from model_runtime_service import RuntimeModelServiceFacade
+from model_registry import create_default_model_registry
+from runtime_grpc_services import register_runtime_grpc_services
+from math_service import MathService
+from punjabi_service import PunjabiConversationService
+from speech_style import (
+    casual_jarvis_reply,
+    clean_model_disclaimers,
+    dynamic_speech_params,
+    format_jarvis_response,
+    prepare_spoken_response_text,
+    process_english_speech,
+)
 
 # COMPREHENSIVE UTF-8 SETUP FOR WINDOWS
 if sys.platform == "win32":
@@ -102,26 +126,51 @@ patch_dynamic_cache()
 class AIService(ai_service_pb2_grpc.AIServiceServicer):
     def __init__(self):
         # Configuration
-        self.model_name = "WizardLMTeam/WizardMath-7B-V1.1"
-        self.phi3_model_name = "microsoft/Phi-3-mini-4k-instruct"
-        self.mistral_api_key = ""  # Replace with your key
-        self.mistral_model = "mistral-large-latest"  # Or "mistral-medium", "mistral-small"
-        self.weather_api_key = "" # openweather_key
+        self.model_name = runtime_settings.wizardmath_model
+        self.phi3_model_name = runtime_settings.phi3_model
+        self.mistral_api_key = runtime_settings.mistral_api_key
+        self.mistral_model = runtime_settings.mistral_model
+        self.weather_api_key = runtime_settings.weather_api_key
+        self.embedding_provider = create_embedding_provider(runtime_settings)
+        self.model_registry = create_default_model_registry(runtime_settings, self.embedding_provider)
+        self.math_service = MathService()
+        self.punjabi_service = PunjabiConversationService()
+        math_health = self.math_service.health()
+        self.model_registry.set_availability(
+            "math_service",
+            True,
+            "available",
+            metadata=math_health,
+        )
+        self.memory = MemoryService(runtime_settings.database_path, embedding_provider=self.embedding_provider)
+        self.tool_registry = create_default_registry(runtime_settings)
+        self.runtime_orchestrator = RuntimeOrchestrator(self.memory, self.tool_registry, self.model_registry)
+        self.runtime_orchestrator.bootstrap_project_memory()
         
         # Initialize with GPU optimization
         self.wizardmath_model = None
         self.wizardmath_tokenizer = None
         self.phi3_model = None
         self.phi3_tokenizer = None
+        self.model_lock = threading.RLock()
         self._initialize_models()
 
         # Add speech control variables
         self.current_speech_thread = None
         self.stop_speech_event = threading.Event()
         self.is_speaking = False
+        self.speech_state_lock = threading.RLock()
+        self.speech_generation = 0
+        self.active_sapi_voice = None
+        self.active_tts_engine = None
+        self.active_audio_process = None
+        self.tts_prime_lock = threading.RLock()
+        self.punjabi_tts_jobs = {}
+        self.punjabi_tts_cache_dir = runtime_settings.runtime_state_dir / "tts_cache" / "punjabi"
+        self.punjabi_tts_cache_dir.mkdir(parents=True, exist_ok=True)
         
-        # Initialize Mistral client
-        self.mistral_client = Mistral(api_key=self.mistral_api_key)
+        # Initialize Mistral client when configured. Local/runtime features still work without it.
+        self.mistral_client = Mistral(api_key=self.mistral_api_key) if self.mistral_api_key else None
 
         # Add this voice engine initialization
         self.voice_engine = pyttsx3.init()
@@ -132,21 +181,18 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
         # Speak startup message
         self._announce_system_status()
 
-        # Initialize database for long-term memory
-        self.db_conn = sqlite3.connect('ai_memory.db', check_same_thread=False)
-        self._init_db()
-
-        # Short-term memory (in-memory)
-        self.current_session = {
-            "mistral": [],
-            "wizardmath": [],
-            "phi3": []
-        }
-        
-        # Memory configuration
+        # Compatibility handles while memory migrates out of this monolithic service.
+        self.db_conn = self.memory.conn
+        self.current_session = self.memory.current_session
         self.max_tokens = 3000
-        self.summary_frequency = 3  # Summarize every 3 exchanges
-        self.max_summaries_to_keep = 100  # Limit database size
+        self.summary_frequency = self.memory.summary_frequency
+        self.max_summaries_to_keep = self.memory.max_summaries_to_keep
+        self.runtime_model_service = RuntimeModelServiceFacade(
+            self.model_registry,
+            load_handlers={"phi3": self._load_phi3_model},
+            unload_handlers={"phi3": self._unload_phi3_model},
+            probe_handlers={"phi3": self._probe_phi3_model},
+        )
 
     def _initialize_models(self):
         """Initialize models with maximum GPU optimization"""
@@ -154,6 +200,12 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
             # Set environment variables to reduce warnings
             os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
             os.environ['TRANSFORMERS_VERBOSITY'] = 'error'  # Reduce verbosity
+
+            if not runtime_settings.eager_load_wizardmath and not runtime_settings.eager_load_phi3:
+                logger.info("Skipping local transformer startup loads. Enable a model with HIVEMIND_EAGER_LOAD_* when needed.")
+                self.model_registry.set_availability("wizardmath", False, "startup_skipped")
+                self.model_registry.set_availability("phi3", False, "startup_skipped")
+                return
 
             # Verify CUDA
             if not torch.cuda.is_available():
@@ -172,62 +224,280 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
 
             # Calculate optimal device map
             max_memory = {0: "7GB", "cpu": "10GB"}  # Leave 1GB GPU buffer
-            
-            # Initialize tokenizer
-            self.wizardmath_tokenizer = AutoTokenizer.from_pretrained(
-                self.model_name,
-                trust_remote_code=True
-            )
-            self.wizardmath_tokenizer.pad_token = self.wizardmath_tokenizer.eos_token
+            offload_folder = runtime_settings.runtime_state_dir / "model_offload"
+            offload_folder.mkdir(parents=True, exist_ok=True)
 
-            # Load model with memory optimization
-            self.wizardmath_model = AutoModelForCausalLM.from_pretrained(
-                self.model_name,
-                trust_remote_code=True,
-                quantization_config=quantization_config,
-                device_map="auto",
-                max_memory=max_memory,
-                dtype=torch.float16,
-                offload_folder="./offload",
-                low_cpu_mem_usage=True
-            ).eval()
-
-            # Initialize Phi-3 Mini
-            logger.info("Loading Phi-3 Mini model...")
-            try:
-                self.phi3_tokenizer = AutoTokenizer.from_pretrained(
-                    self.phi3_model_name,
-                    trust_remote_code=True
+            if not runtime_settings.eager_load_wizardmath:
+                logger.info("Skipping WizardMath startup load. Set HIVEMIND_EAGER_LOAD_WIZARDMATH=true to load it at startup.")
+                self.model_registry.set_availability("wizardmath", False, "startup_skipped")
+            else:
+                wizardmath_ref, wizardmath_is_local = self._resolve_model_reference(
+                    self.model_name,
+                    "WizardMath",
+                    runtime_settings.wizardmath_revision,
                 )
-                self.phi3_tokenizer.pad_token = self.phi3_tokenizer.eos_token
+                wizardmath_load_options = self._transformers_load_options(
+                    runtime_settings.wizardmath_revision,
+                    wizardmath_is_local,
+                )
 
-                self.phi3_model = AutoModelForCausalLM.from_pretrained(
-                    self.phi3_model_name,
+                # Initialize tokenizer
+                self.wizardmath_tokenizer = AutoTokenizer.from_pretrained(
+                    wizardmath_ref,
+                    trust_remote_code=True,
+                    **wizardmath_load_options,
+                )
+                self.wizardmath_tokenizer.pad_token = self.wizardmath_tokenizer.eos_token
+
+                # Load model with memory optimization
+                self.wizardmath_model = AutoModelForCausalLM.from_pretrained(
+                    wizardmath_ref,
                     trust_remote_code=True,
                     quantization_config=quantization_config,
                     device_map="auto",
                     max_memory=max_memory,
                     dtype=torch.float16,
-                    offload_folder="./offload",
-                    low_cpu_mem_usage=True
+                    offload_folder=str(offload_folder),
+                    low_cpu_mem_usage=True,
+                    **wizardmath_load_options,
                 ).eval()
 
-                logger.info("Phi-3 Mini loaded successfully")
+                logger.info(f"WizardMath loaded on devices: {self.wizardmath_model.hf_device_map}")
+                self.model_registry.set_availability("wizardmath", True, "loaded")
 
-            except Exception as e:
-                logger.warning(f"Phi-3 Mini loading failed: {e}")
-                logger.warning("Falling back to Mistral for general queries")
-                self.phi3_model = None
-                self.phi3_tokenizer = None
+            if runtime_settings.eager_load_phi3:
+                # Initialize Phi-3 Mini
+                logger.info("Loading Phi-3 Mini model...")
+                try:
+                    phi3_ref, phi3_is_local = self._resolve_model_reference(
+                        self.phi3_model_name,
+                        "Phi-3",
+                        runtime_settings.phi3_revision,
+                    )
+                    phi3_load_options = self._transformers_load_options(
+                        runtime_settings.phi3_revision,
+                        phi3_is_local,
+                    )
 
-            logger.info(f"WizardMath loaded on devices: {self.wizardmath_model.hf_device_map}")
+                    self.phi3_tokenizer = AutoTokenizer.from_pretrained(
+                        phi3_ref,
+                        trust_remote_code=True,
+                        **phi3_load_options,
+                    )
+                    self.phi3_tokenizer.pad_token = self.phi3_tokenizer.eos_token
+
+                    self.phi3_model = AutoModelForCausalLM.from_pretrained(
+                        phi3_ref,
+                        trust_remote_code=True,
+                        quantization_config=quantization_config,
+                        device_map="auto",
+                        max_memory=max_memory,
+                        dtype=torch.float16,
+                        offload_folder=str(offload_folder),
+                        low_cpu_mem_usage=True,
+                        attn_implementation="eager",
+                        **phi3_load_options,
+                    ).eval()
+
+                    logger.info("Phi-3 Mini loaded successfully")
+
+                except Exception as e:
+                    logger.warning(f"Phi-3 Mini loading failed: {e}")
+                    logger.warning("Falling back to Mistral for general queries")
+                    self.phi3_model = None
+                    self.phi3_tokenizer = None
+            else:
+                logger.info("Skipping Phi-3 startup load. Set HIVEMIND_EAGER_LOAD_PHI3=true to preload it.")
+                self.model_registry.set_availability("phi3", False, "startup_skipped")
+
             if self.phi3_model:
                 logger.info(f"Phi-3 Mini loaded on devices: {self.phi3_model.hf_device_map}")
+                self.model_registry.set_availability("phi3", True, "loaded")
+            elif runtime_settings.eager_load_phi3:
+                self.model_registry.set_availability("phi3", False, "not_loaded")
             logger.info(f"GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
 
         except Exception as e:
             logger.error(f"Model initialization failed: {e}")
             raise RuntimeError("Failed to initialize model with GPU optimization")
+
+    def _transformers_load_options(self, revision="", local_reference=False):
+        options = {}
+        if runtime_settings.transformers_local_files_only or local_reference:
+            logger.info("Transformers local-files-only mode is enabled.")
+            options["local_files_only"] = True
+        if revision and not local_reference:
+            options["revision"] = revision
+        return options
+
+    def _resolve_model_reference(self, model_name, label, revision=""):
+        model_path = Path(model_name).expanduser()
+        if model_path.exists():
+            return str(model_path), True
+
+        if not runtime_settings.local_snapshot_fallback:
+            return model_name, False
+
+        cache_dir = self._hf_model_cache_dir(model_name)
+        snapshots_dir = cache_dir / "snapshots"
+        if not snapshots_dir.exists():
+            return model_name, False
+
+        preferred_revision = revision or self._read_hf_ref(cache_dir / "refs" / "main")
+        if preferred_revision:
+            preferred_snapshot = snapshots_dir / preferred_revision
+            if self._snapshot_has_required_weights(preferred_snapshot):
+                logger.info(f"{label} will load from local cached snapshot {preferred_revision}.")
+                return str(preferred_snapshot), True
+            if preferred_snapshot.exists():
+                logger.warning(f"{label} cached snapshot {preferred_revision} is incomplete; looking for another complete local snapshot.")
+
+        complete_snapshots = [
+            snapshot for snapshot in snapshots_dir.iterdir()
+            if snapshot.is_dir() and self._snapshot_has_required_weights(snapshot)
+        ]
+        if not complete_snapshots:
+            return model_name, False
+
+        selected = max(complete_snapshots, key=lambda item: item.stat().st_mtime)
+        logger.warning(
+            f"{label} current cached revision is incomplete; using complete local snapshot {selected.name}."
+        )
+        return str(selected), True
+
+    def _hf_model_cache_dir(self, model_name):
+        try:
+            from huggingface_hub.constants import HF_HUB_CACHE
+            cache_root = Path(HF_HUB_CACHE)
+        except Exception:
+            cache_root = Path(os.getenv("HF_HUB_CACHE", Path.home() / ".cache" / "huggingface" / "hub"))
+        return cache_root / f"models--{model_name.replace('/', '--')}"
+
+    def _read_hf_ref(self, ref_path):
+        try:
+            return ref_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def _snapshot_has_required_weights(self, snapshot_path):
+        if not snapshot_path.exists():
+            return False
+
+        index_path = snapshot_path / "model.safetensors.index.json"
+        if index_path.exists():
+            try:
+                index = json.loads(index_path.read_text(encoding="utf-8"))
+                required_files = set(index.get("weight_map", {}).values())
+            except (OSError, json.JSONDecodeError):
+                return False
+            return bool(required_files) and all((snapshot_path / file_name).exists() for file_name in required_files)
+
+        return any(snapshot_path.glob("*.safetensors")) or any(snapshot_path.glob("pytorch_model*.bin"))
+
+    def _load_phi3_model(self):
+        with self.model_lock:
+            if self.phi3_model is not None and self.phi3_tokenizer is not None:
+                self.model_registry.set_availability("phi3", True, "loaded")
+                return "Phi-3 is already loaded."
+
+            self.model_registry.set_availability("phi3", False, "loading")
+            try:
+                os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
+                os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
+
+                if not torch.cuda.is_available():
+                    raise RuntimeError("CUDA not available - check your PyTorch installation")
+
+                logger.info(f"Loading Phi-3 on {torch.cuda.get_device_name(0)}")
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True
+                )
+                offload_folder = runtime_settings.runtime_state_dir / "model_offload"
+                offload_folder.mkdir(parents=True, exist_ok=True)
+                phi3_ref, phi3_is_local = self._resolve_model_reference(
+                    self.phi3_model_name,
+                    "Phi-3",
+                    runtime_settings.phi3_revision,
+                )
+                phi3_load_options = self._transformers_load_options(
+                    runtime_settings.phi3_revision,
+                    phi3_is_local,
+                )
+
+                tokenizer = AutoTokenizer.from_pretrained(
+                    phi3_ref,
+                    trust_remote_code=True,
+                    **phi3_load_options,
+                )
+                tokenizer.pad_token = tokenizer.eos_token
+                model = AutoModelForCausalLM.from_pretrained(
+                    phi3_ref,
+                    trust_remote_code=True,
+                    quantization_config=quantization_config,
+                    device_map="auto",
+                    max_memory={0: "7GB", "cpu": "12GB"},
+                    dtype=torch.float16,
+                    offload_folder=str(offload_folder),
+                    low_cpu_mem_usage=True,
+                    attn_implementation="eager",
+                    **phi3_load_options,
+                ).eval()
+
+                self.phi3_tokenizer = tokenizer
+                self.phi3_model = model
+                self.model_registry.set_availability(
+                    "phi3",
+                    True,
+                    "loaded",
+                    metadata={
+                        "device_map": getattr(model, "hf_device_map", {}),
+                        "model_reference": str(phi3_ref),
+                        "cuda_memory_gb": round(torch.cuda.memory_allocated() / 1024**3, 3),
+                    },
+                )
+                return f"Phi-3 loaded successfully from {phi3_ref}."
+            except Exception as exc:
+                self.phi3_model = None
+                self.phi3_tokenizer = None
+                self.model_registry.set_availability("phi3", False, "load_failed", metadata={"last_error": str(exc)})
+                logger.exception("Phi-3 load failed")
+                return f"Phi-3 failed to load: {exc}"
+
+    def _unload_phi3_model(self):
+        with self.model_lock:
+            was_loaded = self.phi3_model is not None or self.phi3_tokenizer is not None
+            self.phi3_model = None
+            self.phi3_tokenizer = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self.model_registry.set_availability(
+                "phi3",
+                False,
+                "unloaded",
+                metadata={
+                    "cuda_memory_gb": round(torch.cuda.memory_allocated() / 1024**3, 3) if torch.cuda.is_available() else 0,
+                },
+            )
+            return "Phi-3 unloaded." if was_loaded else "Phi-3 was already unloaded."
+
+    def _probe_phi3_model(self, prompt):
+        if self.phi3_model is None or self.phi3_tokenizer is None:
+            raise RuntimeError("Phi-3 is not loaded. Load Phi-3 before running the probe.")
+        return self._generate_phi3_response(prompt, remember=False, max_new_tokens=160)
+
+    def _handle_model_command(self, user_input):
+        lowered = (user_input or "").strip().lower()
+        if lowered in {"load phi", "load phi3", "load phi-3", "preload phi", "preload phi3", "preload phi-3"}:
+            return self._load_phi3_model(), "ModelRegistry"
+        if lowered in {"unload phi", "unload phi3", "unload phi-3", "release phi", "release phi3", "release phi-3"}:
+            return self._unload_phi3_model(), "ModelRegistry"
+        if lowered in {"model status", "models status", "list models", "model health", "available models"}:
+            return self.model_registry.describe(), "ModelRegistry"
+        return None, None
 
     def _initialize_voice_engine(self):
         """Initialize voice settings with proper speed control"""
@@ -270,7 +540,7 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
                         if voice_name in voice.GetDescription():
                             self.voice_settings['voice'] = voice
                             self.voice_settings['engine_type'] = 'sapi'
-                            self.voice_settings['rate'] = 0.5  # Slower than normal (-10 to 10)
+                            self.voice_settings['rate'] = -1
                             break
             
                 logger.info("Initialized Windows SAPI voice settings")
@@ -306,64 +576,59 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
             except UnicodeEncodeError:
                 pass  # Skip debug printing if encoding fails
 
-            # Convert gRPC audio bytes to WAV
-            audio = AudioSegment.from_raw(
-                io.BytesIO(request.audio_data),
-                sample_width=2,
-                frame_rate=request.sample_rate,
-                channels=1
-            )
+            language_code = (request.language_code or "en-US").strip()
+            audio_bytes = bytes(request.audio_data)
+            if audio_bytes.startswith(b"RIFF"):
+                audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format="wav")
+            else:
+                audio = AudioSegment.from_raw(
+                    io.BytesIO(audio_bytes),
+                    sample_width=2,
+                    frame_rate=request.sample_rate or 16000,
+                    channels=1
+                )
         
             # Export to WAV format
             wav_io = io.BytesIO()
             audio.export(wav_io, format="wav")
+            wav_io.seek(0)
         
             # Recognize using Google Web API (most accurate free option)
             r = sr.Recognizer()
             with sr.AudioFile(wav_io) as source:
                 audio_data = r.record(source)
 
-                if request.language_code == "pa-IN":
-                    # SAFE Punjabi processing logging
+                last_error = None
+                for google_language, source_name in self._speech_language_attempts(language_code):
                     try:
-                        print("[DEBUG] Processing Punjabi speech recognition...")
-                    except UnicodeEncodeError:
-                        pass
-                    # Punjabi-specific processing
-                    text = r.recognize_google(
-                        audio_data,
-                        language="pa-IN",
-                        show_all=False
-                    )
-                    # SAFE result logging
-                    try:
-                        print(f"[DEBUG] Punjabi recognition result: {text}")
-                    except UnicodeEncodeError:
-                        safe_text = text.encode('unicode_escape').decode('ascii')
-                        print(f"[DEBUG] Punjabi recognition result (Unicode): {safe_text}")
-
-                    # Keep Gurmukhi text as-is
-                    return ai_service_pb2.QueryResponse(
-                        response_text=text,
-                        ai_source="PunjabiSpeechRecognition"
-                    )
-                else:
-                    # Default English processing
-                    try:
-                        print("[DEBUG] Processing English speech recognition...")
+                        print(f"[DEBUG] Processing speech recognition with {google_language}...")
                     except UnicodeEncodeError:
                         pass
 
-                    text = r.recognize_google(
-                        audio_data,
-                        language="en-US",
-                        show_all=False
-                    )
-                    print(f"[DEBUG] English recognition result: {text}")
-                    return ai_service_pb2.QueryResponse(
-                        response_text=text,
-                        ai_source="EnglishSpeechRecognition"
-                    )
+                    try:
+                        text = r.recognize_google(
+                            audio_data,
+                            language=google_language,
+                            show_all=False
+                        )
+                        try:
+                            print(f"[DEBUG] {google_language} recognition result: {text}")
+                        except UnicodeEncodeError:
+                            safe_text = text.encode('unicode_escape').decode('ascii')
+                            print(f"[DEBUG] {google_language} recognition result (Unicode): {safe_text}")
+                        return ai_service_pb2.QueryResponse(
+                            response_text=text,
+                            ai_source=source_name
+                        )
+                    except sr.UnknownValueError as exc:
+                        last_error = exc
+                        continue
+                    except sr.RequestError:
+                        raise
+
+                if last_error:
+                    raise last_error
+                raise RuntimeError("Speech recognition produced no language attempts.")
                 
         except Exception as e:
             logger.error(f"Recognition failed: {e}")
@@ -375,39 +640,144 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
                 pass
             
             return ai_service_pb2.QueryResponse(
-                response_text="ਅਸਮਰੱਥ (Unable to process)" if request.language_code == "pa-IN" else "Unable to process",
+                response_text="ਅਸਮਰੱਥ (Unable to process)" if (request.language_code or "").startswith("pa") else "Unable to process",
                 ai_source="System"
             )
 
-    def _speak_punjabi(self, text):
+    def _speech_language_attempts(self, language_code):
+        normalized = (language_code or "en-US").strip().lower()
+        if normalized.startswith("pa"):
+            return [("pa-IN", "PunjabiSpeechRecognition")]
+        if normalized in {"mixed-in", "auto", "auto-in", "bilingual", "bilingual-in"}:
+            return [
+                ("en-IN", "MixedSpeechRecognition"),
+                ("pa-IN", "PunjabiSpeechRecognition"),
+                ("en-US", "EnglishSpeechRecognition"),
+            ]
+        if normalized == "en-in":
+            return [("en-IN", "EnglishSpeechRecognition")]
+        return [("en-US", "EnglishSpeechRecognition")]
+
+    def _speak_punjabi(self, text, generation=None):
         """Robust Punjabi TTS with proper cleanup"""
-        temp_path = None
         try:
-            # Create temp file
-            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp:
-                temp_path = tmp.name
-        
-            # Generate speech
-            tts = gTTS(text=text, lang='pa', slow=False)
-            tts.save(temp_path)
-        
-            # Verify file
-            if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+            text = normalize_for_tts(self._clean_response_text(text)).strip()
+            if not text:
+                return
+            if generation is not None and self._speech_cancelled(generation):
+                return
+
+            audio_path = self._schedule_punjabi_tts_cache(text)
+            if not audio_path.exists() or audio_path.stat().st_size == 0:
+                self._wait_for_punjabi_tts_cache(audio_path, generation)
+            if not audio_path.exists() or audio_path.stat().st_size == 0:
+                self._generate_punjabi_tts_audio(text, audio_path)
+
+            if not audio_path.exists() or audio_path.stat().st_size == 0:
                 raise RuntimeError("Empty audio file generated")
 
-            # Play audio synchronously
-            sound = AudioSegment.from_mp3(temp_path)
-            play(sound)  # This will block until playback completes
+            if generation is not None and self._speech_cancelled(generation):
+                return
+
+            self._play_audio_file_interruptible(audio_path, generation)
         
         except Exception as e:
             logger.error(f"Punjabi TTS failed: {e}")
-            # Fallback to English
-            self._speak_response(f"[Punjabi unavailable] {text}")
-        finally:
-            if temp_path and os.path.exists(temp_path):
+            fallback = "Punjabi voice playback failed. I can still show the Punjabi reply on screen."
+            self._speak_english_sentences(fallback, generation or self.speech_generation)
+
+    def _punjabi_tts_cache_path(self, text):
+        digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:24]
+        return self.punjabi_tts_cache_dir / f"{digest}.mp3"
+
+    def _prime_tts_for_segments(self, segments):
+        """Warm the expensive speech paths before language switching reaches them."""
+        for text_part, lang in segments:
+            if lang == "pa" and text_part.strip():
+                self._schedule_punjabi_tts_cache(text_part)
+
+    def _schedule_punjabi_tts_cache(self, text):
+        text = normalize_for_tts(self._clean_response_text(text)).strip()
+        if not text:
+            return self._punjabi_tts_cache_path("")
+        audio_path = self._punjabi_tts_cache_path(text)
+        if audio_path.exists() and audio_path.stat().st_size > 0:
+            return audio_path
+
+        key = str(audio_path)
+        with self.tts_prime_lock:
+            existing = self.punjabi_tts_jobs.get(key)
+            if existing and existing.is_alive():
+                return audio_path
+
+            def generate():
                 try:
-                    os.unlink(temp_path)
-                except:
+                    self._generate_punjabi_tts_audio(text, audio_path)
+                except Exception as exc:
+                    logger.debug(f"Punjabi TTS cache generation failed: {exc}")
+                finally:
+                    with self.tts_prime_lock:
+                        self.punjabi_tts_jobs.pop(key, None)
+
+            worker = threading.Thread(target=generate, daemon=True)
+            self.punjabi_tts_jobs[key] = worker
+            worker.start()
+        return audio_path
+
+    def _wait_for_punjabi_tts_cache(self, audio_path, generation=None, timeout=12):
+        key = str(audio_path)
+        start = time.time()
+        while True:
+            with self.tts_prime_lock:
+                worker = self.punjabi_tts_jobs.get(key)
+            if not worker or not worker.is_alive():
+                return audio_path.exists() and audio_path.stat().st_size > 0
+            if generation is not None and self._speech_cancelled(generation):
+                return False
+            if timeout and time.time() - start > timeout:
+                return False
+            worker.join(timeout=0.05)
+
+    def _generate_punjabi_tts_audio(self, text, audio_path):
+        audio_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = audio_path.with_name(f"{audio_path.stem}.{threading.get_ident()}.tmp.mp3")
+        tts = gTTS(text=text, lang='pa', slow=False)
+        tts.save(str(tmp_path))
+        if tmp_path.exists() and tmp_path.stat().st_size > 0:
+            tmp_path.replace(audio_path)
+
+    def _play_audio_file_interruptible(self, audio_path, generation=None):
+        ffplay_path = which("C:/ffmpeg/bin/ffplay.exe") or which("ffplay.exe") or "ffplay"
+        process = subprocess.Popen(
+            [
+                ffplay_path,
+                "-nodisp",
+                "-autoexit",
+                "-loglevel",
+                "quiet",
+                str(audio_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.active_audio_process = process
+        try:
+            while process.poll() is None:
+                if generation is not None and self._speech_cancelled(generation):
+                    process.terminate()
+                    try:
+                        process.wait(timeout=0.4)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    break
+                time.sleep(0.05)
+        finally:
+            if self.active_audio_process is process:
+                self.active_audio_process = None
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                except Exception:
                     pass
             
 
@@ -415,7 +785,7 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
         """gRPC endpoint for system status and weather"""
         greeting = self._get_time_based_greeting()
         location, coords = self._get_location()
-        weather = self._get_weather(*coords)
+        weather = self._get_weather(*coords) if coords else None
     
         # Cross-platform time formatting
         now = datetime.now()
@@ -464,7 +834,6 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
         """J.A.R.V.I.S-style startup announcement"""
         status = self.GetSystemStatus(ai_service_pb2.Empty(), None)
         message = status.weather_report
-        print(f"J.A.R.V.I.S: {message}")
         self._speak_response(message)
 
     def _get_time_based_greeting(self):
@@ -481,12 +850,17 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
     def _get_location(self):
         try:
             g = geocoder.ip('me')
-            return g.city, g.latlng
+            if g and g.latlng:
+                return g.city or "Current location", g.latlng
+            return "Malibu", (34.0259, -118.7798)
         except Exception:
             return "Malibu", (34.0259, -118.7798)  # Default to Tony Stark's home
 
     def _get_weather(self, lat, lng):
             try:
+                if not self.weather_api_key:
+                    logger.info("OpenWeather API key is not configured; skipping weather lookup")
+                    return None
                 url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lng}&appid={self.weather_api_key}&units=metric"
                 response = requests.get(url, timeout=3)
                 response.raise_for_status()
@@ -503,46 +877,63 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
                 return None
 
     def _jarvis_style_response(self, text, ai_source):
-        """Format responses with J.A.R.V.I.S mannerisms"""
+        """Format responses with a calm, varied assistant voice."""
+        return format_jarvis_response(self._clean_response_text(text), ai_source)
 
-        # First clean the text
-        cleaned_text = self._clean_response_text(text)
+    def _punjabi_voice_prompt(self, user_input):
+        return (
+            "Reply in Punjabi using proper Gurmukhi script only. "
+            "Do not use Latin transliteration unless quoting a technical term. "
+            "Keep the answer concise, natural, and easy to speak aloud in one or two sentences. "
+            f"User said: {user_input}"
+        )
 
-        # Add appropriate prefixes based on query type
-        if ai_source == "WizardMath": #"DeepSeek-Math":
-            prefixes = ["The solution appears to be", 
-                       "Calculations complete:",
-                       "Mathematically speaking,"]
-        elif ai_source == "Phi-3":
-            prefixes = ["Analysis complete:",
-                       "My assessment indicates,",
-                       "Based on my reasoning,"]
-        else:
-            prefixes = ["According to my analysis,",
-                       "My research indicates,",
-                       "I would suggest,"]
-    
-        # Randomly select a prefix
-        import random
-        prefix = random.choice(prefixes)
-    
-        # Clean up the response text
-        cleaned_text = cleaned_text.strip()
-        if not cleaned_text.endswith(('.','!','?')):
-            cleaned_text += '.'
-    
-        return f"{prefix} {cleaned_text[0].lower() + cleaned_text[1:]}"  # Lowercase first letter after prefix
+    def _process_with_punjabi(self, user_input):
+        mode = (runtime_settings.punjabi_reply_mode or "local").strip().lower()
+        if mode in {"mistral", "mistral_if_available", "cloud"} and self.mistral_client:
+            return self._process_with_mistral(self._punjabi_voice_prompt(user_input)), "Mistral"
+        if mode in {"phi3", "phi"}:
+            return self._process_with_phi3(self._punjabi_voice_prompt(user_input)), "Phi-3"
+        return self.punjabi_service.handle(user_input), "PunjabiLocal"
+
+    def _punjabi_voice_response(self, text, ai_source):
+        cleaned_text = self._clean_response_text(text).strip()
+        cleaned_text = re.sub(
+            r"^Reply in Punjabi using proper Gurmukhi script only\..*?User said:\s*",
+            "",
+            cleaned_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        cleaned_text = re.sub(r"\s+", " ", cleaned_text).strip()
+        if not cleaned_text:
+            cleaned_text = "ਮਾਫ਼ ਕਰਨਾ ਜੀ, ਮੈਨੂੰ ਪੰਜਾਬੀ ਜਵਾਬ ਬਣਾਉਣ ਵਿੱਚ ਦਿੱਕਤ ਆਈ।"
+        if not self._contains_gurmukhi(cleaned_text):
+            cleaned_text = f"ਜੀ, {cleaned_text}"
+        if not cleaned_text.endswith(('.', '!', '?', '।')):
+            cleaned_text += "।"
+        return cleaned_text
+
+    def _contains_gurmukhi(self, text):
+        return any(0x0A00 <= ord(char) <= 0x0A7F for char in text or "")
     
     def _speak_response(self, text):
         """Proper speech implementation with reliable interruption"""
         if not self.voice_settings:
-            print(f"\nJ.A.R.V.I.S: {text}\n")
+            self._print_jarvis_response(text)
             return
 
-        # Stop any ongoing speech FIRST
-        self.stop_current_speech()
+        # Stop ongoing speech only when there is actually something to stop.
+        if self._has_active_speech():
+            self.stop_current_speech(wait_timeout=0.2)
+        with self.speech_state_lock:
+            self.speech_generation += 1
+            speech_generation = self.speech_generation
+            self.stop_speech_event.clear()
 
-        print(f"\nJ.A.R.V.I.S: {text}\n")
+        self._print_jarvis_response(text)
+        spoken_text = prepare_spoken_response_text(text)
+        if not spoken_text:
+            spoken_text = "I've put the details on screen."
 
         def speak_job():
             try:
@@ -550,10 +941,14 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
                 self.is_speaking = True
             
                 # Split into segments by language
-                segments = self._split_text_by_language(text)
+                segments = self._split_text_by_language(spoken_text)
+                self._prime_tts_for_segments(segments)
+                english_engine = None
+                if any(lang != 'pa' and text_part.strip() for text_part, lang in segments):
+                    english_engine = self._create_english_tts_engine()
             
                 for i, (text_part, lang) in enumerate(segments):
-                    if self.stop_speech_event.is_set():
+                    if self._speech_cancelled(speech_generation):
                         break
                     
                     if not text_part.strip():
@@ -561,116 +956,207 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
 
                     if lang == 'pa':
                         # Punjabi handling (unchanged)
-                        if not self.stop_speech_event.is_set():
-                            self._speak_punjabi(text_part)
+                        if not self._speech_cancelled(speech_generation):
+                            self._speak_punjabi(text_part, speech_generation)
                     else:
                         # ENGLISH: Use sentence-based approach with proper interruption
-                        self._speak_english_sentences(text_part)
+                        self._speak_english_sentences(text_part, speech_generation, engine=english_engine, cleanup=False)
                     
-                    if self.stop_speech_event.is_set():
+                    if self._speech_cancelled(speech_generation):
                         break
                     
             except Exception as e:
                 logger.error(f"Speech failed: {e}")
             finally:
-                self._notify_speech_status("end", text)
-                self.is_speaking = False
-                self.stop_speech_event.clear()
+                try:
+                    if 'english_engine' in locals() and english_engine is not None:
+                        self._cleanup_english_tts_engine(english_engine)
+                except Exception as exc:
+                    logger.debug(f"English TTS cleanup failed: {exc}")
+                with self.speech_state_lock:
+                    is_current = speech_generation == self.speech_generation
+                    if is_current:
+                        self.is_speaking = False
+                        self.stop_speech_event.clear()
+                if is_current:
+                    self._notify_speech_status("end", text)
 
         # Start speech thread
         self.current_speech_thread = threading.Thread(target=speak_job, daemon=True)
         self.current_speech_thread.start()
 
-    def _speak_english_sentences(self, text):
-        """Speak English text with reliable sentence-by-sentence control"""
+    def _print_jarvis_response(self, text):
+        try:
+            print(f"\nJ.A.R.V.I.S: {text}\n")
+        except UnicodeEncodeError:
+            safe_text = str(text).encode('unicode_escape').decode('ascii')
+            print(f"\nJ.A.R.V.I.S (Unicode): {safe_text}\n")
 
-        # Get dynamic parameters based on content
-        speech_params = self._get_dynamic_speech_params(text)
+    def _has_active_speech(self):
+        with self.speech_state_lock:
+            thread_active = self.current_speech_thread is not None and self.current_speech_thread.is_alive()
+            audio_active = self.active_audio_process is not None and self.active_audio_process.poll() is None
+            return bool(
+                self.is_speaking
+                or thread_active
+                or self.active_sapi_voice
+                or self.active_tts_engine
+                or audio_active
+            )
+
+    def _speech_cancelled(self, generation):
+        return self.stop_speech_event.is_set() or generation != self.speech_generation
+
+    def _create_english_tts_engine(self):
+        if self.voice_settings['engine_type'] == 'sapi':
+            engine = win32com.client.Dispatch("SAPI.SpVoice")
+            voice = self.voice_settings.get('voice')
+            if voice is not None:
+                try:
+                    engine.Voice = voice
+                except Exception:
+                    pass
+            self.active_sapi_voice = engine
+            return engine
+
+        engine = pyttsx3.init()
+        self.active_tts_engine = engine
+        if self.voice_settings.get('voice_id'):
+            engine.setProperty('voice', self.voice_settings['voice_id'])
+        return engine
+
+    def _cleanup_english_tts_engine(self, engine):
+        try:
+            if self.voice_settings['engine_type'] == 'pyttsx3':
+                engine.stop()
+        except Exception:
+            pass
+        if self.active_sapi_voice is engine:
+            self.active_sapi_voice = None
+        if self.active_tts_engine is engine:
+            self.active_tts_engine = None
+
+    def _speak_english_sentences(self, text, generation, engine=None, cleanup=True):
+        """Speak English text with reliable sentence-by-sentence control"""
 
         # Process for JARVIS-style speech
         processed_text = self._process_english_speech(text)
         sentences = self._split_into_sentences(processed_text)
     
-        # Initialize engine once
-        if self.voice_settings['engine_type'] == 'sapi':
-            engine = win32com.client.Dispatch("SAPI.SpVoice")
-            engine.Rate = self.voice_settings.get('rate', 0)
-        else:
-            engine = pyttsx3.init()
-            if self.voice_settings.get('voice_id'):
-                engine.setProperty('voice', self.voice_settings['voice_id'])
-            engine.setProperty('rate', 150)
+        if not sentences:
+            return
+
+        if engine is None:
+            engine = self._create_english_tts_engine()
+            cleanup = True
     
         try:
             for i, sentence in enumerate(sentences):
                 # Check for interruption before each sentence
-                if self.stop_speech_event.is_set():
+                if self._speech_cancelled(generation):
                     break
                 
                 # Remove any emphasis markers before speaking
                 clean_sentence = re.sub(r'\*(.*?)\*', r'\1', sentence)
+                speech_params = self._sentence_speech_params(clean_sentence, i, len(sentences))
 
                 # For SAPI, we need to handle interruption differently
                 if self.voice_settings['engine_type'] == 'sapi':
+                    engine.Rate = speech_params.get('sapi_rate', self.voice_settings.get('rate', -1))
+                    try:
+                        engine.Volume = speech_params.get('sapi_volume', 90)
+                    except Exception:
+                        pass
                     # SAPI doesn't have good interruption, so we use a timeout approach
-                    self._sapi_speak_with_timeout(engine, clean_sentence, timeout=10)
+                    self._sapi_speak_with_timeout(engine, clean_sentence, generation, timeout=10)
                 else:
+                    engine.setProperty('rate', speech_params.get('rate', self.voice_settings.get('base_rate', 164)))
+                    engine.setProperty('volume', speech_params.get('volume', self.voice_settings.get('base_volume', 0.9)))
                     # pyttsx3 - use non-blocking approach
                     engine.say(clean_sentence)
                     engine.startLoop(False)
                 
                     start_time = time.time()
                     while engine.isBusy():
-                        if self.stop_speech_event.is_set():
+                        if self._speech_cancelled(generation):
+                            engine.stop()
                             engine.endLoop()
                             return
                         if time.time() - start_time > 8:  # 8 second timeout per sentence
                             break
-                        time.sleep(0.1)
+                        time.sleep(0.03)
                 
                     engine.endLoop()
                 
                 # Add natural pause between sentences (except after last one)
-                if i < len(sentences) - 1 and not self.stop_speech_event.is_set():
-                    time.sleep(0.3)  # 300ms pause between sentences
+                if i < len(sentences) - 1 and not self._speech_cancelled(generation):
+                    self._interruptible_sleep(speech_params.get('pause', 0.24), generation)
 
                 # Check for interruption after each sentence
-                if self.stop_speech_event.is_set():
+                if self._speech_cancelled(generation):
                     break
                 
         finally:
             # Cleanup
-            try:
-                if self.voice_settings['engine_type'] == 'pyttsx3':
-                    engine.stop()
-            except:
-                pass
+            if cleanup:
+                self._cleanup_english_tts_engine(engine)
 
-    def _sapi_speak_with_timeout(self, engine, text, timeout=10):
-        """Speak with SAPI using a timeout approach since interruption is limited"""
-        # SAPI doesn't support interruption well, so we use a separate thread with timeout
-        def sapi_speak():
-            try:
-                engine.Speak(text)
-            except:
-                pass
-            
-        speak_thread = threading.Thread(target=sapi_speak, daemon=True)
-        speak_thread.start()
-    
-        # Wait for completion or timeout or interruption
+    def _sapi_speak_with_timeout(self, engine, text, generation, timeout=10):
+        """Speak with SAPI asynchronously so interrupt can purge queued speech."""
+        speak_async = 1
+        purge_before_speak = 2
+        try:
+            engine.Speak(text, speak_async | purge_before_speak)
+        except Exception as exc:
+            logger.debug(f"SAPI speak failed: {exc}")
+            return
+
         start_time = time.time()
-        while speak_thread.is_alive():
-            if self.stop_speech_event.is_set():
-                # Try to interrupt by speaking empty string (SAPI workaround)
+        while True:
+            if self._speech_cancelled(generation):
                 try:
-                    engine.Speak("")
+                    engine.Speak("", purge_before_speak)
+                    engine.Skip("Sentence", 999)
                 except:
                     pass
                 break
-            if time.time() - start_time > timeout:
+            try:
+                if engine.WaitUntilDone(20):
+                    break
+            except Exception:
                 break
-            time.sleep(0.1)
+            if time.time() - start_time > timeout:
+                try:
+                    engine.Speak("", purge_before_speak)
+                except:
+                    pass
+                break
+
+    def _interruptible_sleep(self, duration, generation, quantum=0.03):
+        end_at = time.time() + max(0.0, float(duration or 0.0))
+        while time.time() < end_at:
+            if self._speech_cancelled(generation):
+                break
+            time.sleep(min(quantum, max(0.0, end_at - time.time())))
+
+    def _sentence_speech_params(self, sentence, index, total):
+        params = dict(self._get_dynamic_speech_params(sentence))
+        lowered = (sentence or "").lower()
+
+        if index == 0 and total > 1:
+            params["rate"] = max(140, params["rate"] - 4)
+            params["pause"] = max(params.get("pause", 0.24), 0.28)
+        if any(term in lowered for term in ["ber", "snr", "errors", "confidence", "probability", "parameters"]):
+            params["rate"] = max(138, params["rate"] - 10)
+            params["volume"] = min(1.0, params.get("volume", 0.9) + 0.03)
+            params["pause"] = max(params.get("pause", 0.24), 0.32)
+        if any(term in lowered for term in ["done", "all set", "we have it", "result is in"]):
+            params["rate"] = min(178, params["rate"] + 4)
+            params["pause"] = max(params.get("pause", 0.24), 0.24)
+
+        params["sapi_rate"] = max(-4, min(3, round((params["rate"] - 160) / 14)))
+        params["sapi_volume"] = max(0, min(100, int(params["volume"] * 100)))
+        return params
 
     def _split_text_by_language(self, text):
         """Improved language segmentation that keeps punctuation with words"""
@@ -715,123 +1201,16 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
         """Add JARVIS speech patterns without using unsupported tags"""
     
         # First clean any remaining artifacts
-        text = self._clean_response_text(text)
-
-        # JARVIS emphasis words
-        emphasis_words = {
-            'alert', 'warning', 'critical', 'sir', 'important', 
-            'calculating', 'analysis', 'emergency', 'priority'
-        }
-    
-        # JARVIS-style phrasing replacements
-        jarvis_phrases = {
-            r'\bi\b': 'I',
-            r'\bim\b': "I'm",
-            r'\bid\b': "I'd", 
-            r'\bive\b': "I've",
-            r'\byoure\b': "you're",
-            r'\bits\b': "it's",
-            r'\bthats\b': "that's",
-            r'\bdont\b': "don't",
-            r'\bwont\b': "won't",
-            r'\bcant\b': "can't",
-        }
-    
-        # Apply phrasing corrections
-        processed = text
-        for pattern, replacement in jarvis_phrases.items():
-            processed = re.sub(pattern, replacement, processed, flags=re.IGNORECASE)
-    
-        # Add emphasis by capitalizing key words (visual emphasis only)
-        for word in emphasis_words:
-            pattern = r'\b' + re.escape(word) + r'\b'
-            processed = re.sub(pattern, word.upper(), processed, flags=re.IGNORECASE)
-    
-        # Handle numbers for clearer pronunciation by adding spaces
-        processed = re.sub(r'(\d{4,})', r' \1 ', processed)  # Long numbers
-        processed = re.sub(r'(\d+)%', r'\1 percent', processed)  # Percentages
-    
-        # Add JARVIS-style polite phrasing
-        if processed.startswith(('I need', 'I want', 'Give me')):
-            processed = processed.replace('I need', 'I require', 1)
-            processed = processed.replace('I want', 'I would like', 1) 
-            processed = processed.replace('Give me', 'Please provide', 1)
-    
-        return processed
+        text = normalize_for_tts(self._clean_response_text(text))
+        return process_english_speech(text)
 
     def _get_dynamic_speech_params(self, text):
         """Calculate speech parameters that actually work with TTS engines"""
-        text_lower = text.lower()
-    
-        # Base parameters
-        base_rate = 170  # Slightly faster for JARVIS
-        base_volume = 0.9
-    
-        # Adjust for content type
-        if any(word in text_lower for word in ['alert', 'warning', 'critical', 'emergency']):
-            # Urgent messages - slower and clearer
-            rate = int(base_rate * 0.85)
-            volume = min(1.0, base_volume * 1.1)
-        elif any(word in text_lower for word in ['calculate', 'equation', 'analysis', 'processing']):
-            # Technical content - normal speed
-            rate = base_rate
-            volume = base_volume
-        elif '?' in text:
-            # Questions - slightly slower
-            rate = int(base_rate * 0.95)
-            volume = base_volume
-        else:
-            # Normal conversation - standard JARVIS speed
-            rate = base_rate
-            volume = base_volume
-    
-        return {
-            'rate': rate,
-            'volume': volume
-        }
+        return dynamic_speech_params(text)
 
     def _split_into_sentences(self, text):
         """Split text into natural speaking chunks"""
-        # Split by punctuation but keep the delimiters
-        parts = re.split('([.!?])', text)
-        sentences = []
-    
-        # Recombine with punctuation
-        i = 0
-        while i < len(parts):
-            if i + 1 < len(parts):
-                sentence = (parts[i] + parts[i+1]).strip()
-                if sentence:
-                    sentences.append(sentence)
-                i += 2
-            else:
-                last_part = parts[i].strip()
-                if last_part:
-                    sentences.append(last_part)
-                i += 1
-    
-        # Further split long sentences for better pacing
-        refined_sentences = []
-        for sentence in sentences:
-            if len(sentence.split()) > 15:  # Split long sentences
-                # Use findall to keep all words including conjunctions
-                pattern = r'[^,;.!?]+[,;]?|[^,;.!?]+[.!?]'
-                clauses = re.findall(pattern, sentence)
-
-                for clause in clauses:
-                    clause = clause.strip()
-                    if clause and len(clause.split()) > 2:  # Meaningful clause
-                        refined_sentences.append(clause)
-                    elif clause:
-                        # Very short clause, attach to previous if possible
-                        if refined_sentences:
-                            refined_sentences[-1] += " " + clause
-                        else:
-                            refined_sentences.append(clause)
-            else:
-                refined_sentences.append(sentence)
-    
-        return refined_sentences
+        return split_into_speech_chunks(text)
 
     def _clean_response_text(self, text):
         """Remove formatting markers, emojis, and other unwanted artifacts from AI responses"""
@@ -846,8 +1225,10 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
         text = re.sub(r'^-\s*', '', text, flags=re.MULTILINE)   # Remove bullet points
         text = re.sub(r'^\d+\.\s*', '', text, flags=re.MULTILINE)  # Remove numbered lists
     
-        # Remove emojis and special symbols
-        text = re.sub(r'[^\w\s.,!?;:()\-@#$%&*+/=<>\[\]{}|\\]', '', text)  # Keep only text, numbers, and basic punctuation
+        # Remove emoji/control noise without stripping Unicode letters or combining marks.
+        # Punjabi vowel signs are combining marks, so a narrow ASCII-ish allowlist breaks Gurmukhi.
+        text = re.sub(r'[\U0001F300-\U0001FAFF\U00002700-\U000027BF]', '', text)
+        text = ''.join(char for char in text if char.isprintable() or char in "\n\t")
     
         # Remove multiple spaces
         text = re.sub(r'\s+', ' ', text)
@@ -870,108 +1251,88 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
     
         return text.strip()
 
-    def stop_current_speech(self):
+    def stop_current_speech(self, wait_timeout=0.25):
         """Proper speech stopping with multiple fallback methods"""
         try:
+            if not self._has_active_speech():
+                with self.speech_state_lock:
+                    self.stop_speech_event.clear()
+                    self.is_speaking = False
+                return False
+
             logger.info("Stopping speech...")
-        
-            # Set stop flag
-            self.stop_speech_event.set()
+            with self.speech_state_lock:
+                self.speech_generation += 1
+                self.stop_speech_event.set()
         
             # Method 1: Stop pyttsx3 if active
             if self.voice_settings and self.voice_settings['engine_type'] == 'pyttsx3':
                 try:
-                    # Force stop any pyttsx3 instance
-                    import pyttsx3
-                    temp_engine = pyttsx3.init()
-                    temp_engine.stop()
-                    # Give it a moment to process
-                    time.sleep(0.2)
-                    temp_engine.stop()
+                    if self.active_tts_engine:
+                        self.active_tts_engine.stop()
                 except Exception as e:
                     logger.debug(f"Pyttsx3 stop: {e}")
+
+            if self.active_audio_process and self.active_audio_process.poll() is None:
+                try:
+                    self.active_audio_process.terminate()
+                    try:
+                        self.active_audio_process.wait(timeout=0.3)
+                    except subprocess.TimeoutExpired:
+                        self.active_audio_process.kill()
+                except Exception as e:
+                    logger.debug(f"Audio process stop: {e}")
         
             # Method 2: For SAPI, try to interrupt by speaking empty string
             if self.voice_settings and self.voice_settings['engine_type'] == 'sapi':
                 try:
-                    temp_sapi = win32com.client.Dispatch("SAPI.SpVoice")
-                    temp_sapi.Speak("")
+                    purge_before_speak = 2
+                    sapi = self.active_sapi_voice or win32com.client.Dispatch("SAPI.SpVoice")
+                    sapi.Speak("", purge_before_speak)
+                    sapi.Skip("Sentence", 999)
                 except Exception as e:
                     logger.debug(f"SAPI stop: {e}")
         
-            # Method 3: Wait for thread to finish
-            if self.current_speech_thread and self.current_speech_thread.is_alive():
-                self.current_speech_thread.join(timeout=1.0)
+            if wait_timeout and self.current_speech_thread and self.current_speech_thread.is_alive():
+                self.current_speech_thread.join(timeout=wait_timeout)
             
-            # Reset state
-            self.is_speaking = False
-            self.stop_speech_event.clear()
+            with self.speech_state_lock:
+                self.is_speaking = False
+                if not self.current_speech_thread or not self.current_speech_thread.is_alive():
+                    self.stop_speech_event.clear()
+                    self.active_sapi_voice = None
+                    self.active_tts_engine = None
+                    self.active_audio_process = None
+            self._notify_speech_status("end", "interrupted")
         
             logger.info("Speech stopped")
+            return True
         
         except Exception as e:
             logger.error(f"Error stopping speech: {e}")
+            return False
 
     def InterruptSpeech(self, request, context):
         """gRPC method to interrupt current speech"""
         try:
-            logger.info("Received speech interrupt request")
-            self.stop_current_speech()
-            return ai_service_pb2.InterruptResponse(success=True, message="Speech interrupted")
+            stopped = self.stop_current_speech()
+            message = "Speech interrupted" if stopped else "No active speech to interrupt"
+            if stopped:
+                logger.info("Received speech interrupt request")
+            return ai_service_pb2.InterruptResponse(success=True, message=message)
         except Exception as e:
             logger.error(f"Failed to interrupt speech: {e}")
             return ai_service_pb2.InterruptResponse(success=False, message=str(e))
 
     def _init_db(self):
-            """Initialize the database tables"""
-            cursor = self.db_conn.cursor()
-        
-            # Create tables if they don't exist
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS conversation_memory (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    model_type TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-        
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS memory_summaries (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    model_type TEXT NOT NULL,
-                    summary TEXT NOT NULL,
-                    original_count INTEGER NOT NULL,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-        
-            # Create index for faster queries
-            cursor.execute('''
-                CREATE INDEX IF NOT EXISTS idx_model_type ON memory_summaries (model_type)
-            ''')
-        
-            self.db_conn.commit()
+            """Compatibility wrapper; schema ownership moved to MemoryService."""
+            self.memory.init_db()
 
     def _add_to_memory(self, model_type, role, content):
             """Add conversation to memory with automatic summarization"""
             try:
-                # Add to current session (short-term memory)
-                self.current_session[model_type].append({
-                    "role": role,
-                    "content": content,
-                    "timestamp": datetime.now().isoformat()
-                })
-            
-                # Store in database (long-term raw memory)
-                cursor = self.db_conn.cursor()
-                cursor.execute('''
-                    INSERT INTO conversation_memory (model_type, role, content)
-                    VALUES (?, ?, ?)
-                ''', (model_type, role, content))
-                self.db_conn.commit()
-            
+                self.memory.add_conversation(model_type, role, content)
+
                 # Check if we need to summarize
                 if len(self.current_session[model_type]) >= self.summary_frequency:
                     self._summarize_conversation(model_type)
@@ -992,35 +1353,24 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
                     for msg in recent_chat
                 )
             
-                # Get summary from Mistral
-                summary_prompt = f"""Please summarize the key points from this conversation in 3-4 bullet points:
-            
-                {conversation_text}
-            
-                Summary:
-                - """
-            
-                summary_response = self.mistral_client.chat.complete(
-                    model="mistral-small",
-                    messages=[{"role": "user", "content": summary_prompt}],
-                    max_tokens=150
-                )
-            
-                summary = summary_response.choices[0].message.content
-            
-                # Store summary in database
-                cursor = self.db_conn.cursor()
-                cursor.execute('''
-                    INSERT INTO memory_summaries (model_type, summary, original_count)
-                    VALUES (?, ?, ?)
-                ''', (model_type, summary, len(recent_chat)))
-                self.db_conn.commit()
-            
-                # Clear current session after summarization
-                self.current_session[model_type] = []
-            
-                # Enforce max summaries limit
-                self._cleanup_old_summaries(model_type)
+                if self.mistral_client:
+                    summary_prompt = f"""Please summarize the key points from this conversation in 3-4 bullet points:
+
+                    {conversation_text}
+
+                    Summary:
+                    - """
+
+                    summary_response = self.mistral_client.chat.complete(
+                        model="mistral-small",
+                        messages=[{"role": "user", "content": summary_prompt}],
+                        max_tokens=150
+                    )
+                    summary = summary_response.choices[0].message.content
+                else:
+                    summary = conversation_text[:500]
+
+                self.memory.add_summary(model_type, summary, len(recent_chat))
             
             except Exception as e:
                 logger.error(f"Summarization failed: {e}")
@@ -1028,27 +1378,7 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
     def _cleanup_old_summaries(self, model_type):
             """Remove oldest summaries to maintain database size limit"""
             try:
-                cursor = self.db_conn.cursor()
-            
-                # Get count of summaries for this model
-                cursor.execute('''
-                    SELECT COUNT(*) FROM memory_summaries 
-                    WHERE model_type = ?
-                ''', (model_type,))
-                count = cursor.fetchone()[0]
-            
-                if count > self.max_summaries_to_keep:
-                    # Delete oldest entries exceeding the limit
-                    cursor.execute('''
-                        DELETE FROM memory_summaries
-                        WHERE id IN (
-                            SELECT id FROM memory_summaries
-                            WHERE model_type = ?
-                            ORDER BY timestamp ASC
-                            LIMIT ?
-                        )
-                    ''', (model_type, count - self.max_summaries_to_keep))
-                    self.db_conn.commit()
+                self.memory.cleanup_old_summaries(model_type)
                 
             except Exception as e:
                 logger.error(f"Failed to clean up old summaries: {e}")
@@ -1056,64 +1386,32 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
     def _get_recent_summaries(self, model_type, limit=2):
             """Retrieve most recent summaries from database"""
             try:
-                cursor = self.db_conn.cursor()
-                cursor.execute('''
-                    SELECT summary FROM memory_summaries
-                    WHERE model_type = ?
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                ''', (model_type, limit))
-            
-                return [row[0] for row in cursor.fetchall()]
+                return self.memory.recent_summaries(model_type, limit)
             except Exception as e:
                 logger.error(f"Failed to fetch summaries: {e}")
                 return []
 
     def _get_context(self, model_type, new_query):
             """Build context from both short-term and long-term memory"""
-            # Get recent messages from current session
-            recent_messages = self.current_session[model_type].copy()
-        
-            # Get relevant summaries from database
-            summaries = self._get_recent_summaries(model_type)
-        
-            # Prepare context messages
-            context_messages = []
-        
-            # Add summaries as system messages
-            for summary in summaries:
-                context_messages.append({
-                    "role": "system",
-                    "content": f"Previous conversation summary: {summary}"
-                })
-        
-            # Add recent messages
-            for msg in recent_messages:
-                context_messages.append({
-                    "role": msg["role"],
-                    "content": msg["content"]
-                })
-        
-            # Add new query
-            context_messages.append({
-                "role": "user",
-                "content": new_query
-            })
-        
-            return context_messages
+            return self.memory.context_messages(model_type, new_query)
 
     def ProcessQuery(self, request, context):
         """Process queries with full J.A.R.V.I.S personality"""
         try:
             # Display user input
             # SAFE Unicode printing for user input
-            user_input = request.input_text
+            raw_input = request.input_text or ""
+            runtime_prefix = "__hivemind_runtime__:"
+            silent_runtime_request = raw_input.startswith(runtime_prefix)
+            user_input = raw_input[len(runtime_prefix):].strip() if silent_runtime_request else raw_input
             try:
-                print(f"\nUSER: {user_input}")
+                label = "RUNTIME" if silent_runtime_request else "USER"
+                print(f"\n{label}: {user_input}")
             except UnicodeEncodeError:
                 # Fallback: print escaped Unicode
                 safe_text = user_input.encode('unicode_escape').decode('ascii')
-                print(f"\nUSER (Unicode): {safe_text}")
+                label = "RUNTIME" if silent_runtime_request else "USER"
+                print(f"\n{label} (Unicode): {safe_text}")
 
             # Detect if input is Punjabi
             is_punjabi = False
@@ -1134,33 +1432,96 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
             except Exception as detect_error:
                 print(f"Language detection error: {detect_error}")
                 is_punjabi = False
+
+            model_command_response, model_command_source = self._handle_model_command(user_input)
+            if model_command_response:
+                if silent_runtime_request:
+                    return ai_service_pb2.QueryResponse(
+                        response_text=model_command_response,
+                        ai_source=model_command_source
+                )
+                self._add_to_memory("runtime", "user", user_input)
+                self._add_to_memory("runtime", "assistant", model_command_response)
+                response = (
+                    self._punjabi_voice_response(model_command_response, model_command_source)
+                    if is_punjabi else
+                    self._jarvis_style_response(model_command_response, model_command_source)
+                )
+                self._speak_response(response)
+                return ai_service_pb2.QueryResponse(
+                    response_text=response,
+                    ai_source=model_command_source
+                )
+
+            orchestrated_response, orchestrated_source = self.runtime_orchestrator.try_handle(user_input)
+            if orchestrated_response:
+                if silent_runtime_request:
+                    return ai_service_pb2.QueryResponse(
+                        response_text=orchestrated_response,
+                        ai_source=orchestrated_source
+                )
+                self._add_to_memory("runtime", "user", user_input)
+                self._add_to_memory("runtime", "assistant", orchestrated_response)
+                response = (
+                    self._punjabi_voice_response(orchestrated_response, orchestrated_source)
+                    if is_punjabi else
+                    self._jarvis_style_response(orchestrated_response, orchestrated_source)
+                )
+                self._speak_response(response)
+                return ai_service_pb2.QueryResponse(
+                    response_text=response,
+                    ai_source=orchestrated_source
+                )
+
+            if silent_runtime_request:
+                return ai_service_pb2.QueryResponse(
+                    response_text="Unsupported runtime command.",
+                    ai_source="RuntimeOrchestrator"
+                )
+
+            casual_response = None if is_punjabi else casual_jarvis_reply(user_input)
+            if casual_response:
+                self._add_to_memory("phi3", "user", user_input)
+                self._add_to_memory("phi3", "assistant", casual_response)
+                response = self._jarvis_style_response(casual_response, "JarvisLocal")
+                self._speak_response(response)
+                return ai_service_pb2.QueryResponse(
+                    response_text=response,
+                    ai_source="JarvisLocal"
+                )
         
-            # Get response
-            if self._is_math_or_code_query(request.input_text):
-                raw_response = self._process_with_wizardmath(request.input_text)
-                ai_source = "WizardMath"
-            elif self._should_use_phi3(user_input):  # NEW: Phi-3 for general queries
-                raw_response = self._process_with_phi3(user_input)
-                ai_source = "Phi-3"
-            else:
+            route_decision = self.model_registry.route_decision(user_input)
+            print(
+                f"[ROUTER] intent={route_decision.intent} target={route_decision.target} "
+                f"confidence={route_decision.confidence:.2f} reason={route_decision.reason}",
+                flush=True,
+            )
+
+            if route_decision.target == "math_service":
+                raw_response = self.math_service.handle(user_input)
+                ai_source = "MathService"
+            elif route_decision.target == "runtime_orchestrator":
+                raw_response = (
+                    "I recognized this as a runtime/tool request, but no specific adapter route matched it. "
+                    "Try `list tools`, `tool health`, or `run capability tool.capability {\"param\": \"value\"}`."
+                )
+                ai_source = "RuntimeOrchestrator"
+            elif is_punjabi:
+                raw_response, ai_source = self._process_with_punjabi(user_input)
+            elif route_decision.target == "mistral" and self.mistral_client:
                 raw_response = self._process_with_mistral(request.input_text)
                 ai_source = "Mistral"
+            else:
+                if route_decision.target == "mistral":
+                    logger.info("Mistral route selected but API key is missing; using Phi-3 fallback.")
+                raw_response = self._process_with_phi3(user_input)
+                ai_source = "Phi-3"
         
-            # Apply J.A.R.V.I.S formatting
-            response = self._jarvis_style_response(raw_response, ai_source)
-
-            # Special handling for Punjabi responses
             if is_punjabi:
-                response = response.replace("sir", "ਜੀ")  # Replace "sir" with Punjabi equivalent
+                response = self._punjabi_voice_response(raw_response, ai_source)
+            else:
+                response = self._jarvis_style_response(raw_response, ai_source)
         
-            # Display and speak simultaneously
-            # SAFE Unicode printing for JARVIS response
-            try:
-                print(f"J.A.R.V.I.S: {response}")
-            except UnicodeEncodeError:
-                safe_response = response.encode('unicode_escape').decode('ascii')
-                print(f"J.A.R.V.I.S (Unicode): {safe_response}")
-
             self._speak_response(response)
         
             return ai_service_pb2.QueryResponse(
@@ -1179,66 +1540,18 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
             # Check if it's a Punjabi query and provide appropriate error message
             error_msg = "ਮਾਫ਼ ਕਰਨਾ ਜੀ, ਮੈਂ ਇਸ ਸਵਾਲ ਨੂੰ ਸਮਝ ਨਹੀਂ ਸਕਿਆ।"  # "Sorry, I couldn't understand this question"
         
-            # SAFE error printing
-            try:
-                print(f"J.A.R.V.I.S: {error_msg}")
-            except UnicodeEncodeError:
-                safe_error = error_msg.encode('unicode_escape').decode('ascii')
-                print(f"J.A.R.V.I.S (Unicode): {safe_error}")
-            
             self._speak_response(error_msg)
             return ai_service_pb2.QueryResponse(
                 response_text=error_msg,
                 ai_source="System"
             )
 
-    def _is_math_or_code_query(self, text):
-        """More precise routing between DeepSeek and Mistral"""
-        text_lower = text.lower()
-    
-        # Keywords that DEFINITELY require DeepSeek
-        math_keywords = ["solve", "calculate", "equation", "integral", "derivative", "x=", "wizardmath"]
-        # code_keywords = ["code", "python", "function", "algorithm", "programming", "loop"]
-    
-        # Questions that should go to Mistral despite keywords
-        mistral_exceptions = [
-            "what is", "explain", "tell me about", "history of", 
-            "who invented", "why is", "how does"
-        ]
-    
-        # Check for exceptions first
-        if any(phrase in text_lower for phrase in mistral_exceptions):
-            return False
-    
-        # Default to DeepSeek for math/code
-        return any(keyword in text_lower for keyword in math_keywords) # + code_keywords)
-
-    def _should_use_phi3(self, text):
-        """Determine if Phi-3 should handle this query"""
-        text_lower = text.lower()
-    
-        # Phi-3 handles general knowledge, reasoning, and conversation
-        phi3_keywords = [
-            "what is", "how", "explain", "tell me about", "why is",
-            "who is", "when did", "where is", "can you", "could you",
-            "would you", "should I", "what are", "how does", "help me", "whats"
-        ]
-    
-        # Exceptions that should go to Mistral (complex/long-form)
-        mistral_exceptions = [
-            "write a", "create a", "generate", "long", "detailed",
-            "comprehensive", "essay", "article", "story"
-        ]
-    
-        # Check for exceptions first
-        if any(phrase in text_lower for phrase in mistral_exceptions):
-            return False
-    
-        # Use Phi-3 for general knowledge and reasoning
-        return any(phrase in text_lower for phrase in phi3_keywords)
-
     def _process_with_wizardmath(self, prompt):
         """Process math queries with WizardMath with reliable answer extraction"""
+        if self.wizardmath_model is None or self.wizardmath_tokenizer is None:
+            logger.warning("WizardMath is not loaded; falling back to Mistral/runtime response")
+            return self._process_with_mistral(prompt)
+
         # Use a more structured prompt template
         template = """Please solve the following math problem carefully:
     
@@ -1293,6 +1606,10 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
     def _process_with_mistral(self, prompt):
         """Enhanced Mistral processing with memory integration"""
         try:
+            if not self.mistral_client:
+                self._add_to_memory("mistral", "user", prompt)
+                return "Mistral is not configured. Set HIVEMIND_MISTRAL_API_KEY to enable cloud model routing, or ask for available local runtime tools."
+
             # Step 1: Get context from memory system
             messages = self._get_context("mistral", prompt)
         
@@ -1329,14 +1646,22 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
 
     def _process_with_phi3(self, prompt):
         """Process general queries with Phi-3 Mini"""
-        try:
-            # Check if Phi-3 is available
-            # if self.phi3_model is None or self.phi3_tokenizer is None:
-            #     logger.warning("Phi-3 not available, falling back to Mistral")
-            #     return self._process_with_mistral(prompt)
+        return self._generate_phi3_response(prompt, remember=True, max_new_tokens=160)
 
-            # Use simpler chat formatting to avoid template issues
-            chat_prompt = f"<|user|>\n{prompt}<|end|>\n<|assistant|>\n"
+    def _generate_phi3_response(self, prompt, remember=True, max_new_tokens=256):
+        try:
+            if self.phi3_model is None or self.phi3_tokenizer is None:
+                logger.warning("Phi-3 is not loaded; falling back when possible")
+                if remember and self.mistral_client:
+                    return self._process_with_mistral(prompt)
+                return (
+                    "Phi-3 is not loaded yet, and Mistral is not configured. "
+                    "Ask for runtime tools/model status, load Phi-3 from the Runtime panel, "
+                    "or enable Phi-3 preload in .env."
+                )
+
+            model_prompt = self._phi3_jarvis_prompt(prompt)
+            chat_prompt = f"<|user|>\n{model_prompt}<|end|>\n<|assistant|>\n"
         
             inputs = self.phi3_tokenizer(
                 chat_prompt, 
@@ -1347,7 +1672,7 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
         
             # Use simpler generation parameters to avoid cache issues
             generation_config = {
-                'max_new_tokens': 256,
+                'max_new_tokens': max_new_tokens,
                 'do_sample': True,
                 'temperature': 0.7,
                 'top_p': 0.9,
@@ -1363,14 +1688,19 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
                     **generation_config,
                     use_cache=False  # This avoids the DynamicCache entirely
                 )
-        
-            response = self.phi3_tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+            input_token_count = inputs["input_ids"].shape[-1]
+            generated_tokens = outputs[0][input_token_count:]
+            response = self.phi3_tokenizer.decode(generated_tokens, skip_special_tokens=True)
         
             # Extract only the assistant's response
             if "<|assistant|>" in response:
                 assistant_response = response.split("<|assistant|>")[-1].strip()
             else:
                 assistant_response = response.replace(chat_prompt, "").strip()
+            assistant_response = self._remove_prompt_echo(assistant_response, model_prompt)
+            assistant_response = self._remove_prompt_echo(assistant_response, prompt)
+            assistant_response = clean_model_disclaimers(assistant_response)
         
             # Clean up any end tokens
             assistant_response = assistant_response.replace("<|end|>", "").strip()
@@ -1379,14 +1709,42 @@ class AIService(ai_service_pb2_grpc.AIServiceServicer):
                 assistant_response = "I've processed your request. How can I assist you further?"
         
             # Store in memory
-            self._add_to_memory("phi3", "user", prompt)
-            self._add_to_memory("phi3", "assistant", assistant_response)
+            if remember:
+                self._add_to_memory("phi3", "user", prompt)
+                self._add_to_memory("phi3", "assistant", assistant_response)
         
             return assistant_response
         
         except Exception as e:
             logger.error(f"Phi-3 processing failed: {e}")
             return "I apologize, but I'm having trouble processing your request at the moment."
+
+    def _phi3_jarvis_prompt(self, prompt):
+        return (
+            "You are J.A.R.V.I.S inside a local desktop engineering assistant with working voice output. "
+            "Sound calm, natural, concise, and technically capable. "
+            "Do not say you are text-based, fictional, unable to make sound, or 'as an AI language model'. "
+            "Do not prepend canned phrases. For casual greetings, reply in one short sentence. "
+            "For technical requests, answer directly in no more than three concise sentences unless detail is required.\n\n"
+            f"User: {prompt}"
+        )
+
+    def _remove_prompt_echo(self, response, prompt):
+        cleaned = (response or "").strip()
+        prompt_text = (prompt or "").strip()
+        if not cleaned or not prompt_text:
+            return cleaned
+
+        prompt_variants = [
+            prompt_text,
+            f"User: {prompt_text}",
+            f"<|user|>\n{prompt_text}",
+        ]
+        for variant in prompt_variants:
+            if cleaned.lower().startswith(variant.lower()):
+                cleaned = cleaned[len(variant):].lstrip(" \n\r\t:-")
+                break
+        return cleaned.strip()
 
     def _notify_speech_status(self, status, message=""):
         for q in speech_status_subscribers:
@@ -1428,16 +1786,23 @@ def serve():
         futures.ThreadPoolExecutor(max_workers=10),
         options=(('grpc.so_reuseport', 1),)  # Allow port reuse
     )
-    ai_service_pb2_grpc.add_AIServiceServicer_to_server(AIService(), server)
+    ai_service = AIService()
+    ai_service_pb2_grpc.add_AIServiceServicer_to_server(ai_service, server)
+    register_runtime_grpc_services(
+        server,
+        ai_service.runtime_orchestrator.runtime_service,
+        ai_service.runtime_model_service,
+        ai_service,
+    )
     
-    port = find_available_port()
-    server.add_insecure_port(f'[::]:{port}')
+    port = find_available_port(runtime_settings.port, runtime_settings.port_scan_limit)
+    bind_host = f'[{runtime_settings.host}]' if ":" in runtime_settings.host else runtime_settings.host
+    server.add_insecure_port(f'{bind_host}:{port}')
     
     try:
 
         server.start()
-        # logger.info(f"Server started successfully on port {port} (PID: {os.getpid()})", flush=True)
-        print("Server started successfully on port 50051", flush=True)
+        print(f"Server started successfully on port {port}", flush=True)
         logger.info("Python gRPC server is running...")
         server.wait_for_termination()
     except KeyboardInterrupt:
